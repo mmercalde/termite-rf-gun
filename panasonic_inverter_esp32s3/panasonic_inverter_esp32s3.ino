@@ -15,12 +15,12 @@
  *    BROWN  = ground            -> ESP GND
  *  CONDITIONS TO START (per CAPTURE run1 of the working oven's command):
  *    - frequency = 222 Hz (measured period 4509us)
- *    - steady-state command = ~87.5% HIGH duty (idle HIGH, ~565us LOW notch)
+ *    - steady-state command = ~85% HIGH duty (idle HIGH, ~665us LOW notch, run2)
  *    - NO soft-start ramp: oven drives full duty from cycle one; inverter's own
  *      closed-loop current regulation handles magnetron inrush internally
  *    - more HIGH duty = more power (oven's only down-modulation dipped to ~65%)
  *    - TTL 3.3-5V push-pull (below 3V it won't work)
- *    Drive 87.5% directly. The old "<=43% gate" just under-drove: HV but no osc.
+ *    Drive 85% directly. The old "<=43% gate" just under-drove: HV but no osc.
  *
  *  ESP32-S3 PINS (unchanged hardware from LG build):
  *    GPIO4 = PWM command out (push-pull TTL) -> Panasonic YELLOW
@@ -63,25 +63,25 @@ constexpr int PIN_LOG = 6;     // command-line capture tap (5V via divider) -> s
 
 constexpr bool INVERT_CMD = false;   // CONFIRMED: more HIGH duty = more power (capture run1)
 
-constexpr uint32_t TICKS = 200;      // 0.5% duty resolution so we can hit 87.5% exactly
+constexpr uint32_t TICKS = 200;      // 0.5% duty resolution
 uint32_t cmdFreqHz = 222;            // MEASURED oven command period 4509us = 222Hz
-int      curDuty   = 88;             // PERCENT high-duty (measured oven full power ~87.5%)
+int      curDuty   = 85;             // PERCENT high-duty (MEASURED run2: 85.0-85.5%)
 bool     running   = false;
 
 // Frequency: MEASURED 222Hz on the working oven (4509us period). Kept selectable.
 const uint32_t FREQ_LIST[] = {110, 150, 165, 180, 200, 222, 233, 250, 280, 300};
 const int FREQ_COUNT = sizeof(FREQ_LIST)/sizeof(FREQ_LIST[0]);
 int freqIdx = 5;                     // 222Hz (measured)
-// RUN POWER steps (Button 2), in PERCENT high-duty. Oven full-power = 87.5%.
+// RUN POWER steps (Button 2), in PERCENT high-duty. Oven command = ~85%.
 // Its only down-modulation in the capture dipped to ~65% (less power), confirming
-// higher HIGH-duty = more power. 87.5% is the real oscillation point.
+// higher HIGH-duty = more power. ~85% is the measured oven command.
 const int RUN_STEPS[] = {65, 75, 80, 85, 88, 90};   // % HIGH duty
 const int RUN_COUNT = sizeof(RUN_STEPS)/sizeof(RUN_STEPS[0]);
-int runIdx = 4;                      // default run power 88% (== measured oven full power)
-int curRunDuty = 88;
+int runIdx = 3;                      // default run power 85% (== measured oven command)
+int curRunDuty = 85;
 constexpr int HUNT_DUTY = 30;        // (legacy)
 constexpr int DUTY_MIN = 10, DUTY_MAX = 95;
-constexpr int FULL_DUTY = 88;        // measured oven full-power high-duty (~87.5%)
+constexpr int FULL_DUTY = 85;        // MEASURED oven command high-duty (run2: 85.0-85.5%)
 
 // ---- ISR PWM + phase-locked half-frequency second signal ----
 hw_timer_t* pwmTimer = nullptr;
@@ -145,14 +145,14 @@ void cmdOff(){ drvEnabled=false; sig2Enabled=false; sinkTicks=0;
     GPIO.out_w1tc=(1u<<PIN_PWM); GPIO.out_w1tc=(1u<<PIN_SIG2); }   // both LOW
 void cmdOn (){ tickCounter=0; cycleCounter=0; drvEnabled=true; sig2Enabled=true; timerStart(cmdFreqHz); }
 
-// CAPTURE FINDING (run1): the working oven sends FULL duty (~87.5% HIGH, 222Hz)
+// CAPTURE FINDING (run2, clean): oven sends ~85% HIGH duty @ 222Hz from cycle one
 // from the very first cycle - there is NO soft-start staircase. The inverter's
 // own closed-loop current regulation handles magnetron inrush internally; the
 // command is simply "full power". So we drive the measured command directly.
 // (The old 43% gate just under-drove the tube: HV present, no oscillation.)
 void startRun(){
     cmdFreqHz=FREQ_LIST[freqIdx];
-    setDuty(curRunDuty);                 // default 88% == measured oven full power
+    setDuty(curRunDuty);                 // default 85% == measured oven command
     cmdOn(); running=true;
     Serial.printf("[ON] driving %d%% HIGH @ %luHz (measured oven command). BTN2/p to adjust.\n",
                   curRunDuty,(unsigned long)cmdFreqHz);
@@ -174,7 +174,7 @@ void stopRun(){ cmdOff(); running=false; Serial.println("[OFF] command=0."); }
 // entire PC capture is:   cat /dev/ttyACM0 > run.txt     (Ctrl-C after "DONE").
 // This build does NOT drive the inverter — set BOOT_AUTOLOG 0 to return to
 // normal drive mode (one-line change, re-flash).
-#define BOOT_AUTOLOG 1
+#define BOOT_AUTOLOG 0
 constexpr uint32_t LOG_WINDOW_MS = 10000;   // capture window measured from first edge
 
 volatile uint32_t logT[LOG_MAXEDGES];
@@ -298,8 +298,8 @@ void setup(){
     delay(200);
     Serial.println("\n===============================================");
     Serial.println(" Panasonic CN701 3-pin inverter driver");
-    Serial.println(" MEASURED command: 222Hz, 87.5% HIGH duty, no soft-start (drive direct).");
-    Serial.println(" BTN1(GPIO1)=on/off  BTN2(GPIO2)=RUN POWER (default 88%)");
+    Serial.println(" MEASURED command: 222Hz, ~85% HIGH duty, no soft-start (drive direct).");
+    Serial.println(" BTN1(GPIO1)=on/off  BTN2(GPIO2)=RUN POWER (default 85%)");
     Serial.println(" GPIO4->YELLOW(PWM) ; BROWN->GND ; ORANGE->1k->GND ; zc on GPIO7");
     Serial.println(" 'log' = capture oven command on GPIO6.  ? for help.");
     Serial.println("===============================================");
