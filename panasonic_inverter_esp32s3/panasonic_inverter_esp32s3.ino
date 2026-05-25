@@ -13,11 +13,14 @@
  *    YELLOW = PWM command in   <- ESP GPIO4 (true TTL push-pull, 3.3-5V, 220Hz)
  *    ORANGE = must be tied to GND through a 1k resistor (can't float)
  *    BROWN  = ground            -> ESP GND
- *  CONDITIONS TO START (all required):
- *    - frequency MUST be ~220 Hz (other freqs won't start it)
- *    - duty cycle MUST be <= 43% (above 43% it will NOT start)
- *    - TTL signal level 3.3-5V (below 3V it won't work) -> PUSH-PULL, not open-drain
- *    Start low (~20%) then raise duty toward 43% for more power.
+ *  CONDITIONS TO START (per CAPTURE run1 of the working oven's command):
+ *    - frequency = 222 Hz (measured period 4509us)
+ *    - steady-state command = ~87.5% HIGH duty (idle HIGH, ~565us LOW notch)
+ *    - NO soft-start ramp: oven drives full duty from cycle one; inverter's own
+ *      closed-loop current regulation handles magnetron inrush internally
+ *    - more HIGH duty = more power (oven's only down-modulation dipped to ~65%)
+ *    - TTL 3.3-5V push-pull (below 3V it won't work)
+ *    Drive 87.5% directly. The old "<=43% gate" just under-drove: HV but no osc.
  *
  *  ESP32-S3 PINS (unchanged hardware from LG build):
  *    GPIO4 = PWM command out (push-pull TTL) -> Panasonic YELLOW
@@ -58,26 +61,27 @@ constexpr int PIN_BTN_ONOFF = 1;
 constexpr int PIN_BTN_POWER = 2;
 constexpr int PIN_LOG = 6;     // command-line capture tap (5V via divider) -> see logger
 
-constexpr bool INVERT_CMD = false;   // flip if higher duty = lower power on bench
+constexpr bool INVERT_CMD = false;   // CONFIRMED: more HIGH duty = more power (capture run1)
 
-constexpr uint32_t TICKS = 100;
-uint32_t cmdFreqHz = 220;            // start guess; Button 2 cycles candidates
-int      curDuty   = 30;             // FIXED safe duty during freq hunt (<43%)
+constexpr uint32_t TICKS = 200;      // 0.5% duty resolution so we can hit 87.5% exactly
+uint32_t cmdFreqHz = 222;            // MEASURED oven command period 4509us = 222Hz
+int      curDuty   = 88;             // PERCENT high-duty (measured oven full power ~87.5%)
 bool     running   = false;
 
-// Frequency: confirmed ~220Hz works on the single-IGBT board. Kept selectable.
-const uint32_t FREQ_LIST[] = {110, 150, 165, 180, 200, 220, 233, 250, 280, 300};
+// Frequency: MEASURED 222Hz on the working oven (4509us period). Kept selectable.
+const uint32_t FREQ_LIST[] = {110, 150, 165, 180, 200, 222, 233, 250, 280, 300};
 const int FREQ_COUNT = sizeof(FREQ_LIST)/sizeof(FREQ_LIST[0]);
-int freqIdx = 5;                     // 220Hz (confirmed working)
-// RUN POWER steps (Button 2). Start gate is <=43%, but RUN power goes higher to
-// cross the magnetron oscillation threshold. Ramp up to get actual microwave output.
-const int RUN_STEPS[] = {43, 50, 60, 70, 80, 90};
+int freqIdx = 5;                     // 222Hz (measured)
+// RUN POWER steps (Button 2), in PERCENT high-duty. Oven full-power = 87.5%.
+// Its only down-modulation in the capture dipped to ~65% (less power), confirming
+// higher HIGH-duty = more power. 87.5% is the real oscillation point.
+const int RUN_STEPS[] = {65, 75, 80, 85, 88, 90};   // % HIGH duty
 const int RUN_COUNT = sizeof(RUN_STEPS)/sizeof(RUN_STEPS[0]);
-int runIdx = 2;                      // default run power 60%
-int curRunDuty = 60;
-constexpr int HUNT_DUTY = 30;        // (legacy, used if you want a fixed low probe)
-constexpr int DUTY_MIN = 10, DUTY_MAX = 90;
-constexpr int START_DUTY_MAX = 43;            // startup gate
+int runIdx = 4;                      // default run power 88% (== measured oven full power)
+int curRunDuty = 88;
+constexpr int HUNT_DUTY = 30;        // (legacy)
+constexpr int DUTY_MIN = 10, DUTY_MAX = 95;
+constexpr int FULL_DUTY = 88;        // measured oven full-power high-duty (~87.5%)
 
 // ---- ISR PWM + phase-locked half-frequency second signal ----
 hw_timer_t* pwmTimer = nullptr;
@@ -133,22 +137,25 @@ void IRAM_ATTR onZeroCross() {
     zcLastUs = now; zcSeen = true;
 }
 
-void setDuty(int d){ if(d<DUTY_MIN)d=DUTY_MIN; if(d>DUTY_MAX)d=DUTY_MAX; curDuty=d; sinkTicks=d; }
+// d is PERCENT high-duty; scale to ticks (TICKS=200 -> 0.5% resolution)
+void setDuty(int d){ if(d<DUTY_MIN)d=DUTY_MIN; if(d>DUTY_MAX)d=DUTY_MAX; curDuty=d;
+                     sinkTicks=(uint32_t)d*TICKS/100; }
 
 void cmdOff(){ drvEnabled=false; sig2Enabled=false; sinkTicks=0;
     GPIO.out_w1tc=(1u<<PIN_PWM); GPIO.out_w1tc=(1u<<PIN_SIG2); }   // both LOW
 void cmdOn (){ tickCounter=0; cycleCounter=0; drvEnabled=true; sig2Enabled=true; timerStart(cmdFreqHz); }
 
-// Start at safe <=43% gate, then RAMP UP past 43% toward full power so the
-// magnetron actually crosses its oscillation threshold (~4kV anode + hot filament).
-// Staying at the startup gate gives HV but NO oscillation - must drive harder.
+// CAPTURE FINDING (run1): the working oven sends FULL duty (~87.5% HIGH, 222Hz)
+// from the very first cycle - there is NO soft-start staircase. The inverter's
+// own closed-loop current regulation handles magnetron inrush internally; the
+// command is simply "full power". So we drive the measured command directly.
+// (The old 43% gate just under-drove the tube: HV present, no oscillation.)
 void startRun(){
-    setDuty(START_DUTY_MAX); cmdFreqHz=FREQ_LIST[freqIdx]; cmdOn(); running=true;
-    Serial.printf("[ON] start %d%% @ %luHz. Filament warming...\n",
-                  START_DUTY_MAX,(unsigned long)cmdFreqHz);
-    delay(2000);                         // let filament heat + magnetron begin
-    setDuty(curRunDuty);
-    Serial.printf("[ON] ramped to %d%% (drive for oscillation). Use BTN2/p to adjust.\n", curRunDuty);
+    cmdFreqHz=FREQ_LIST[freqIdx];
+    setDuty(curRunDuty);                 // default 88% == measured oven full power
+    cmdOn(); running=true;
+    Serial.printf("[ON] driving %d%% HIGH @ %luHz (measured oven command). BTN2/p to adjust.\n",
+                  curRunDuty,(unsigned long)cmdFreqHz);
 }
 void stopRun(){ cmdOff(); running=false; Serial.println("[OFF] command=0."); }
 
@@ -178,11 +185,15 @@ void logDump(){
     if(!logIdx){ Serial.println("[log] no edges captured."); return; }
     uint32_t base=logT[0];
     Serial.println("---RAW BEGIN---");
+    Serial.flush();
     Serial.println("idx,t_us,level,dt_us");
-    for(uint32_t i=0;i<logIdx;i++)
+    for(uint32_t i=0;i<logIdx;i++){
         Serial.printf("%lu,%lu,%u,%lu\n",(unsigned long)i,
             (unsigned long)(logT[i]-base),logL[i],
             (unsigned long)(i?logT[i]-logT[i-1]:0));
+        if((i & 0x1F)==0){ Serial.flush(); delay(2); }   // pace every 32 lines -> no overrun
+    }
+    Serial.flush();
     Serial.printf("---RAW END--- %lu edges\n",(unsigned long)logIdx);
     // per-cycle: period = rise-to-rise, high = rise-to-fall (command idles HIGH,
     // notches LOW, so duty_high = idle fraction; watch which way it moves w/ power)
@@ -192,9 +203,10 @@ void logDump(){
     for(uint32_t i=0;i<logIdx;i++){
         if(logL[i]==1){                       // rising
             if(sawRise){ uint32_t per=logT[i]-prevRise;
-                if(per) Serial.printf("%lu,%.1f,%lu,%lu,%.1f\n",(unsigned long)cyc++,
+                if(per){ Serial.printf("%lu,%.1f,%lu,%lu,%.1f\n",(unsigned long)cyc++,
                     (riseT-base)/1000.0,(unsigned long)per,(unsigned long)highUs,
-                    100.0*highUs/per); }
+                    100.0*highUs/per);
+                    if((cyc & 0x1F)==0){ Serial.flush(); delay(2); } } }
             prevRise=logT[i]; riseT=logT[i]; sawRise=true;
         } else if(sawRise){ highUs=logT[i]-riseT; }   // falling
     }
@@ -251,7 +263,7 @@ void handle(String c){
                         (unsigned long)zcPeriodUs, zcSeen?"live":"none yet",
                         zcPeriodUs?1000000.0/zcPeriodUs:0.0); }
     else if(lc.startsWith("p")){ int d=c.substring(1).toInt(); setDuty(d);
-                        Serial.printf("[p] power=%d%% (clamped 10-90)\n",curDuty); }
+                        Serial.printf("[p] power=%d%% (clamped 10-95)\n",curDuty); }
     else if(lc.startsWith("f")){ long h=c.substring(1).toInt(); if(h>0){cmdFreqHz=h; if(running)timerStart(h);
                         Serial.printf("[f]%luHz\n",(unsigned long)cmdFreqHz);} }
     else Serial.println("? (try ?)");
@@ -266,14 +278,14 @@ void setup(){
     attachInterrupt(PIN_ZC, onZeroCross, RISING);
     pinMode(PIN_BTN_ONOFF, INPUT_PULLUP);
     pinMode(PIN_BTN_POWER, INPUT_PULLUP);
-    setDuty(START_DUTY_MAX); cmdFreqHz=FREQ_LIST[freqIdx]; curRunDuty=RUN_STEPS[runIdx];
+    cmdFreqHz=FREQ_LIST[freqIdx]; curRunDuty=RUN_STEPS[runIdx]; setDuty(curRunDuty);
     delay(200);
     Serial.println("\n===============================================");
     Serial.println(" Panasonic CN701 3-pin inverter driver");
-    Serial.println(" TTL push-pull. Single-IGBT board. Start <=43% then ramp BTN2 for oscillation.");
-    Serial.println(" BTN1(GPIO1)=on/off  BTN2(GPIO2)=RUN POWER (ramp to oscillate)");
+    Serial.println(" MEASURED command: 222Hz, 87.5% HIGH duty, no soft-start (drive direct).");
+    Serial.println(" BTN1(GPIO1)=on/off  BTN2(GPIO2)=RUN POWER (default 88%)");
     Serial.println(" GPIO4->YELLOW(PWM) ; BROWN->GND ; ORANGE->1k->GND ; zc on GPIO7");
-    Serial.println(" ? for help.");
+    Serial.println(" 'log' = capture oven command on GPIO6.  ? for help.");
     Serial.println("===============================================");
 }
 
