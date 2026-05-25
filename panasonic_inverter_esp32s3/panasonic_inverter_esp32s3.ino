@@ -31,7 +31,14 @@
  *    p <25..75>      set power (duty %) directly, clamped to valid range
  *    f <hz>          set command frequency (default 233)
  *    zc              report measured zero-cross period (monitor only)
+ *    log             CAPTURE MODE: log the real oven's command on GPIO6, then
+ *                    cold-start the oven; dumps RAW + per-cycle CSV over serial
+ *    logdump         dump the capture early (before the buffer fills)
  *    status / ?
+ *
+ *  CAPTURE WIRING (for 'log' mode — tapping the working oven's main board):
+ *    oven CN701 pin1 (5V PWM) --[2.2k]--+--[3.3k]-- GND ;  tap -> GPIO6 (~3.0V)
+ *    oven GND -- ESP GND (common ground required). GPIO6 is NOT 5V tolerant.
  *
  *  BUTTONS:
  *    BTN1 (GPIO1) = ON/OFF toggle
@@ -49,6 +56,7 @@ constexpr int PIN_SIG2 = 5;    // second signal -> CN701 pin3 (110Hz/50%, rectan
 constexpr int PIN_ZC  = 7;     // zero-cross in (monitor only for Panasonic)
 constexpr int PIN_BTN_ONOFF = 1;
 constexpr int PIN_BTN_POWER = 2;
+constexpr int PIN_LOG = 6;     // command-line capture tap (5V via divider) -> see logger
 
 constexpr bool INVERT_CMD = false;   // flip if higher duty = lower power on bench
 
@@ -144,6 +152,63 @@ void startRun(){
 }
 void stopRun(){ cmdOff(); running=false; Serial.println("[OFF] command=0."); }
 
+// ============================================================================
+//  COMMAND-LINE LOGGER — capture the real oven's command on CN701 pin1.
+//  Edge-logs every transition with microsecond timestamps (no buffer-depth
+//  tradeoff like the DS213), then prints RAW + per-cycle duty CSV. This is the
+//  measurement that tells the drive code the true ramp + steady-state shape.
+//  Never drives and logs at once (logArm stops any running command first).
+// ============================================================================
+#define LOG_MAXEDGES 8000            // ~18 s at ~440 edges/s. 40KB SRAM.
+volatile uint32_t logT[LOG_MAXEDGES];
+volatile uint8_t  logL[LOG_MAXEDGES];
+volatile uint32_t logIdx = 0;
+volatile bool     logArmed = false;
+
+void IRAM_ATTR onLogEdge(){
+    if(!logArmed || logIdx>=LOG_MAXEDGES) return;
+    logT[logIdx]=micros();
+    logL[logIdx]=(uint8_t)digitalRead(PIN_LOG);   // new level after the edge
+    logIdx++;
+}
+
+void logDump(){
+    logArmed=false;
+    detachInterrupt(PIN_LOG);
+    if(!logIdx){ Serial.println("[log] no edges captured."); return; }
+    uint32_t base=logT[0];
+    Serial.println("---RAW BEGIN---");
+    Serial.println("idx,t_us,level,dt_us");
+    for(uint32_t i=0;i<logIdx;i++)
+        Serial.printf("%lu,%lu,%u,%lu\n",(unsigned long)i,
+            (unsigned long)(logT[i]-base),logL[i],
+            (unsigned long)(i?logT[i]-logT[i-1]:0));
+    Serial.printf("---RAW END--- %lu edges\n",(unsigned long)logIdx);
+    // per-cycle: period = rise-to-rise, high = rise-to-fall (command idles HIGH,
+    // notches LOW, so duty_high = idle fraction; watch which way it moves w/ power)
+    Serial.println("---CYCLE BEGIN---");
+    Serial.println("cycle,t_start_ms,period_us,high_us,duty_high_pct");
+    uint32_t cyc=0,prevRise=0,riseT=0,highUs=0; bool sawRise=false;
+    for(uint32_t i=0;i<logIdx;i++){
+        if(logL[i]==1){                       // rising
+            if(sawRise){ uint32_t per=logT[i]-prevRise;
+                if(per) Serial.printf("%lu,%.1f,%lu,%lu,%.1f\n",(unsigned long)cyc++,
+                    (riseT-base)/1000.0,(unsigned long)per,(unsigned long)highUs,
+                    100.0*highUs/per); }
+            prevRise=logT[i]; riseT=logT[i]; sawRise=true;
+        } else if(sawRise){ highUs=logT[i]-riseT; }   // falling
+    }
+    Serial.println("---CYCLE END---");
+}
+
+void logArm(){
+    if(running) stopRun();                    // never drive and log simultaneously
+    logIdx=0; logArmed=true;
+    pinMode(PIN_LOG, INPUT);
+    attachInterrupt(PIN_LOG, onLogEdge, CHANGE);
+    Serial.println("[log] ARMED on GPIO6 — cold-start the oven now. 'logdump' to dump early.");
+}
+
 // ---- buttons ----
 unsigned long lastB1=0, lastB2=0;
 constexpr unsigned long DEBOUNCE_MS=200;
@@ -171,12 +236,15 @@ void handle(String c){
     String lc=c; lc.toLowerCase();
     if(lc=="?"||lc=="help"){
         Serial.println(F("on  off  p<10-90>  f<hz>  sig2on  sig2off  zc  status"));
+        Serial.println(F("log  logdump  (capture oven command on GPIO6 via divider)"));
         Serial.println(F("BTN1=on/off BTN2=cycle-freq | GPIO4=pin1 GPIO5=pin3 ; duty fixed 30%"));
     }
     else if(lc=="sig2on"){ sig2Enabled=true; Serial.println("[sig2] 110Hz signal ENABLED on GPIO5"); }
     else if(lc=="sig2off"){ sig2Enabled=false; GPIO.out_w1tc=(1u<<PIN_SIG2); Serial.println("[sig2] DISABLED (GPIO5 held low)"); }
     else if(lc=="on"){ startRun(); }
     else if(lc=="off"){ stopRun(); }
+    else if(lc=="log"){ logArm(); }
+    else if(lc=="logdump"){ logDump(); }
     else if(lc=="status"){ Serial.printf("[status] running=%d power=%d%% freq=%luHz zcPeriod=%luus invert=%d\n",
                             running,curDuty,(unsigned long)cmdFreqHz,(unsigned long)zcPeriodUs,INVERT_CMD); }
     else if(lc=="zc"){ Serial.printf("[zc] last period=%luus (%s)  ~%.1fHz\n",
@@ -216,5 +284,6 @@ void loop(){
         else if(buf.length()<32) buf+=ch;
     }
     pollButtons();
+    if(logArmed && logIdx>=LOG_MAXEDGES){ Serial.println("[log] buffer full."); logDump(); }
     delay(2);
 }
