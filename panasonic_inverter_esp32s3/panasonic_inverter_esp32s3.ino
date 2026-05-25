@@ -167,14 +167,27 @@ void stopRun(){ cmdOff(); running=false; Serial.println("[OFF] command=0."); }
 //  Never drives and logs at once (logArm stops any running command first).
 // ============================================================================
 #define LOG_MAXEDGES 8000            // ~18 s at ~440 edges/s. 40KB SRAM.
+
+// ---- BOOT AUTO-LOG: unattended capture so the PC side is just a `cat` ----
+// When 1: the board arms the logger on boot, captures from the first edge, and
+// auto-dumps after LOG_WINDOW_MS (or buffer full). No typing required, so the
+// entire PC capture is:   cat /dev/ttyACM0 > run.txt     (Ctrl-C after "DONE").
+// This build does NOT drive the inverter — set BOOT_AUTOLOG 0 to return to
+// normal drive mode (one-line change, re-flash).
+#define BOOT_AUTOLOG 1
+constexpr uint32_t LOG_WINDOW_MS = 10000;   // capture window measured from first edge
+
 volatile uint32_t logT[LOG_MAXEDGES];
 volatile uint8_t  logL[LOG_MAXEDGES];
 volatile uint32_t logIdx = 0;
 volatile bool     logArmed = false;
+volatile uint32_t logFirstUs = 0;           // micros() of the very first edge
 
 void IRAM_ATTR onLogEdge(){
     if(!logArmed || logIdx>=LOG_MAXEDGES) return;
-    logT[logIdx]=micros();
+    uint32_t t=micros();
+    if(logIdx==0) logFirstUs=t;             // mark window start at first real edge
+    logT[logIdx]=t;
     logL[logIdx]=(uint8_t)digitalRead(PIN_LOG);   // new level after the edge
     logIdx++;
 }
@@ -211,11 +224,14 @@ void logDump(){
         } else if(sawRise){ highUs=logT[i]-riseT; }   // falling
     }
     Serial.println("---CYCLE END---");
+    Serial.flush();
+    Serial.println("===CAPTURE DONE=== (safe to Ctrl-C the cat now)");
+    Serial.flush();
 }
 
 void logArm(){
     if(running) stopRun();                    // never drive and log simultaneously
-    logIdx=0; logArmed=true;
+    logIdx=0; logFirstUs=0; logArmed=true;
     pinMode(PIN_LOG, INPUT);
     attachInterrupt(PIN_LOG, onLogEdge, CHANGE);
     Serial.println("[log] ARMED on GPIO6 — cold-start the oven now. 'logdump' to dump early.");
@@ -287,6 +303,12 @@ void setup(){
     Serial.println(" GPIO4->YELLOW(PWM) ; BROWN->GND ; ORANGE->1k->GND ; zc on GPIO7");
     Serial.println(" 'log' = capture oven command on GPIO6.  ? for help.");
     Serial.println("===============================================");
+#if BOOT_AUTOLOG
+    delay(500);
+    Serial.println("[AUTOLOG] capture build. PC side: cat /dev/ttyACM0 > run.txt");
+    Serial.println("[AUTOLOG] arming now — cold-start the oven on Quick Min.");
+    logArm();
+#endif
 }
 
 void loop(){
@@ -297,5 +319,8 @@ void loop(){
     }
     pollButtons();
     if(logArmed && logIdx>=LOG_MAXEDGES){ Serial.println("[log] buffer full."); logDump(); }
+    if(logArmed && logIdx>0 && (micros()-logFirstUs) > LOG_WINDOW_MS*1000UL){
+        Serial.println("[log] capture window elapsed."); logDump();
+    }
     delay(2);
 }
