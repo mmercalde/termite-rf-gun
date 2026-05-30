@@ -24,17 +24,24 @@ architecture but not the dual-IGBT topology.
 not sold in the US. The European/Asian regulatory paths (CE, VDE, BSI,
 IEC, CCC) do not require public schematic disclosure.
 
-**Conclusion:** there is no *official* schematic for F6645M301GP or any
-other 230V dual-IGBT Panasonic inverter. However, a community-sourced
-reverse-engineered schematic of a Panasonic universal-input (110V/220V)
-dual-IGBT inverter has been located and archived in the repo at:
+**Conclusion:** there is no *official Panasonic-published* schematic for
+F6645M301GP specifically, but two schematics of similar dual-IGBT inverter
+generations are archived in the repo:
 
-**`docs/reference/Panasonic_Inverter_Schematic_Annotated.pdf`**
+1. **PRIMARY: `docs/reference/Panasonic_ServiceCD_Schematic.png`** — taken
+   from the Panasonic Service CD (via VK3HZ's PDF). Shows full component
+   detail except the proprietary controller ASIC. This is the authoritative
+   reference.
 
-This shows the same dual-IGBT half-bridge topology and labels all key
-components by reference designator and value. See the [Component values
-from the archived schematic](#component-values-from-the-archived-schematic)
-section below for extracted values.
+2. **Supplementary: `docs/reference/Panasonic_Inverter_Schematic_Annotated.pdf`** —
+   community reverse-engineering of a universal-input variant. Useful for
+   cross-reference but contains some errors relative to the Panasonic
+   schematic. Use only when the Panasonic schematic doesn't provide enough
+   detail.
+
+Both show the same dual-IGBT half-bridge topology as F6645M301GP. See the
+[Component values](#component-values--panasonic-service-cd-schematic--bench-measurements)
+section below.
 
 ---
 
@@ -82,67 +89,94 @@ damage on existing boards.
 
 ---
 
-## Component values from the archived schematic
+## Component values — Panasonic Service CD schematic + bench measurements
 
-Extracted from `docs/reference/Panasonic_Inverter_Schematic_Annotated.pdf`
-(community reverse-engineering of a universal-input 110V/220V board with
-the same dual-IGBT topology as F6645M301GP).
+**Primary reference:** `docs/reference/Panasonic_ServiceCD_Schematic.png`
+(Panasonic's own schematic from the Panasonic Service CD, reproduced in
+VK3HZ's writeup). This supersedes the Russian community reverse-engineering
+which contained some errors.
 
 ### Half-bridge IGBT topology
 
 The schematic confirms **dual-IGBT half-bridge** architecture:
 
-- **Q701** (low-side, bottom switch): G60N321 in the reference schematic
-  (our boards use GT50J327; both are same TO-247 series-resonant family)
-  - Gate driven by Q703/Q704/Q705 totem-pole (C2785 NPN + A1174 PNP) direct from +20V rail
+- **Q702** (top IGBT, high-side switch)
+  - Gate driven through R710 + R711 + R707 (36Ω each) + R712 + R713 (11Ω) +
+    R714 (11Ω 1/2W) + ZD703, ZD704 clamps
+  - R708, R709 (33kΩ each) as gate bleed/clamp
+  - Elaborate gate drive because high-side requires level-shifting
+- **Q701** (bottom IGBT, low-side switch)
+  - Gate driven by Q703/Q704/Q705 totem-pole (NPN/PNP/NPN complementary pair)
+  - R704 (10Ω) inline gate resistor
+  - R705 (10kΩ) gate-emitter pulldown
   - Simpler gate drive because it's ground-referenced
-- **Q702** (high-side, top switch): GT30J322 in the reference schematic
-  (our boards use GT35J321; both are same series-resonant family)
-  - Gate driven through R707-709 (33kΩ bleed) + R710-712 (36+11+36) + ZD703/ZD704 clamps
-  - More elaborate gate drive because it's high-side / level-shifted
 
-The asymmetry in gate drive networks explains the asymmetry in IGBT
-current ratings — high-side carries different di/dt and dv/dt stress than
-low-side, hence the smaller current rating on Q702.
+The asymmetric gate drive networks (more complex for Q702, simpler for Q701)
+are why Panasonic uses asymmetric IGBT current ratings — high-side and
+low-side see different di/dt and dv/dt stress.
 
-### Key component values (reference design)
+### Component values from Panasonic Service CD schematic
 
 | Ref | Value | Role |
 |-----|-------|------|
-| **C701** | **0.68 µF / 500 V** | **Resonant tank capacitor** — critical for resonant frequency |
-| **C702** | 4 µF / 250 V | DC bus filter (deliberately small per VK3HZ) |
-| C703 | (small film) | Snubber |
-| **C704, C705** | 8200 pF / 3 kV | HV doubler capacitors (inside T701 assembly) |
-| C707 | 470 µF / 25 V | +20V rail bulk cap |
 | L701 | (line choke) | Mains filter |
+| DB701 | Bridged Diode | Mains rectifier |
+| C702 | 4 µF | DC bus filter (deliberately small per VK3HZ) |
 | CT701 | Current transformer | Input current sense → constant-power loop |
-| **R715-R717** | **4.5 kΩ 15 W** | Sand-bar wirewound bias supply (runs hot in normal operation) |
-| R722 | 270 Ω | (Bias network) |
-| R723, R721, R718, R720 | 201K, 241K, 180K, 241K | Voltage divider, AC sense |
-| R725 | 200 kΩ | (Sense pull-up) |
-| R702 | 15 kΩ | Gate-emitter clamp on Q701 (not the sand-bar) |
-| D704, D705 | 6.2 V (A6V71) | Low-voltage detect zeners |
-| ZD701, ZD702, ZD705 | (zeners) | Bias rail clamps |
+| R702 | 15 kΩ | Sense divider |
+| R708 (one occurrence) | 10 kΩ | Sense divider |
+| R704 | 10 Ω | Q701 gate inline resistor |
+| R705 | 10 kΩ | Q701 gate-emitter pulldown |
+| R707, R710, R711 | 36 Ω each | Q702 gate resistor network |
+| R713, R714 | 11 Ω each | Q702 gate network |
+| R708, R709 | 33 kΩ each | Q702 gate bleed |
+| C701 | 0.1 µF | Across IGBTs (snubber/resonant) |
+| C703 | 0.45 µF | Tank cap area |
+| C706, C706E | 0.4 µF each | Tank cap |
 | ZD703, ZD704 | (zeners) | Q702 gate clamp |
-| D706 | LED + diode | Status feedback to IC701 |
-| R732 | 11 kΩ | IC702 LED current limit |
-| R733 | 1.5 kΩ | IC701 phototransistor pull-up |
+| D703 | (diode) | Sense/clamp |
+| T701 | HV transformer | Step-up + bias winding |
+| D701, D702 | UX-C2B (HV diodes) | HV doubler |
+| C704, C705 | 8200 pF each | HV doubler caps (schematic value) |
+| R701 | 100 MΩ | HV output bleeder |
+| CN703 | HV output 4000V/300mA | To magnetron anode |
+| H701, H702 | — | Magnetron heater terminals |
+| IC702 + D706 + R733 (1 kΩ) | Command opto | DPC → inverter |
+| IC703 + R732 (11 kΩ) | Status opto | Inverter → DPC |
 
-### Note on F606YM300BP/F6645M301GP value differences
+### F6645M301GP-specific deltas — Michael's actual board
 
-The archived schematic shows a universal-input board. Our 230V-only
-F6645M301GP family may use different specific values, particularly:
+Several component values on Michael's specific board differ from the
+generic Panasonic Service CD schematic. These are documented in detail in
+`docs/reference/README.md`. Summary:
 
-- **C701 resonant cap**: F606YM300BP parts list shows ECWF5184N300 which
-  decodes to ~0.18 µF. The universal-input reference shows 0.68 µF /
-  500V. Different sizing optimizes for the operating voltage/frequency
-  point — but the *role* is identical.
-- **Bridge rectifier**: 230V boards need higher voltage rating
-- **Mains caps**: 230V rated parts
+| Ref | Schematic value | Michael's board | Status |
+|-----|-----------------|-----------------|--------|
+| C701 | 0.1 µF | **0.18 µF** (WFK 184J 500V) | Photo confirmed |
+| C704 | 8200 pF | 8200 pF (DHC 822J 3000V) | Photo confirmed |
+| C705 | 8200 pF | **5600 pF** (DHC 562J 3000V) | Photo confirmed — asymmetric |
+| R702 | 15 kΩ | **3.5 kΩ 15W** (RYC-3 3K5J) | Photo confirmed |
+| R701 | 100 MΩ | 100 MΩ (OL on meter) | Bench confirmed |
+| Q701 | (TO-247 IGBT) | IHW40N120R5 | Infineon replacement |
+| Q702 | (TO-247 IGBT) | IHW30N120R5 | Infineon replacement |
 
-Use the archived schematic to understand **topology and signal
-relationships**, but verify specific values against the actual board
-when needed.
+The asymmetric HV doubler caps and different C701 value indicate this is
+a later revision than the schematic documented.
+
+### Note on Russian reverse-engineering
+
+The earlier-archived `Panasonic_Inverter_Schematic_Annotated.pdf` (Russian
+community reverse-engineering) was used as primary reference in initial
+project work. It contains some errors relative to the Panasonic Service CD
+schematic:
+- Q701/Q702 values for resonant cap shown as 0.68 µF (Panasonic says 0.1 µF;
+  Michael's board has 0.18 µF — closer to Panasonic)
+- Specific part numbers (C2785 NPN, A1174 PNP) for gate drivers were
+  speculative; Panasonic shows generic transistor symbols
+- Controller IC pin numbering (2-15) shown was speculative
+
+Use the Russian schematic only as a supplementary reference. When values
+disagree, trust the Panasonic Service CD schematic.
 
 ### Controller IC functional blocks
 
@@ -164,22 +198,42 @@ generation) handles these functions, labeled in the schematic:
 
 ---
 
-## CN701 interface (definitive)
+## CN701 interface
 
 3-pin connector from inverter board to Digital Programmer Circuit (DPC).
-Pin roles confirmed by VK3HZ canonical reverse-engineering. Pin numbering
-on F6645M301GP per our bench measurements:
 
-| Pin | Color  | Role | Driven by | Signal |
-|-----|--------|------|-----------|--------|
-| 1   | Yellow | Command  | DPC (or our ESP32) | 220-222 Hz square wave, variable duty = power setpoint |
-| 2   | Brown  | GND      | Common | Opto-isolated ground reference |
-| 3   | Orange | Status   | **Inverter** | 110 Hz / 50% square wave, present only when magnetron is drawing current |
+**Pin roles per the Panasonic Service CD schematic:**
 
-Critical: pin 3 is INPUT to the controller, not output. The inverter
-generates the 110 Hz status signal internally and the controller monitors
-it. Our firmware must NOT drive this line — it must read it. See
-`VK3HZ_FINDINGS.md` for the startup sequence implications.
+| Pin (Panasonic schematic) | Role | Driven by | Signal |
+|---------------------------|------|-----------|--------|
+| 3   | Command (input to inverter) | DPC (or our ESP32) | 220-222 Hz square wave, variable duty = power setpoint, 2-3V level |
+| 2   | 0V (GND)                    | Common              | Opto-isolated ground reference |
+| 1   | Status (output from inverter) | **Inverter ASIC** | 110 Hz / 50% square wave, present only when magnetron is drawing current, 2-3V level |
+
+**Note on pin numbering vs wire colors:**
+
+Earlier project documentation used a different pin numbering convention
+(swapping pin 1 and pin 3 labels). The *physical wiring* on Michael's
+build matches the Panasonic schematic correctly — GPIO4 drives the
+inverter's command input, GPIO5 reads the inverter's status output.
+Only the numerical labels in some docs needed correction; no physical
+rewiring is required.
+
+The colors-to-roles mapping on Michael's actual cable:
+- **Yellow** wire = command (GPIO4 → inverter command input)
+- **Brown** wire = GND (common)
+- **Orange** wire = status (inverter status output → GPIO5)
+
+If documentation elsewhere in this repo refers to "pin 1 = command" or
+"pin 3 = status," that's the older convention. The Panasonic schematic
+is authoritative going forward.
+
+**Critical:** the status line (orange, GPIO5) is INPUT to the ESP32.
+The inverter generates the 110 Hz status signal internally; our firmware
+must NOT drive this line — it must read it. The previous firmware
+revision (before commit `3128125`) drove this line, which corrupted the
+inverter's internal feedback loop and contributed to IGBT failure. See
+`VK3HZ_FINDINGS.md` for the startup-sequence implications.
 
 ---
 
@@ -336,4 +390,10 @@ board if we ever need definitive answers.
 - 2026-05-30 Added archived community schematic reference (universal-input
   dual-IGBT), extracted component values and gate-drive topology details.
   Confirmed both Q701 and Q702 are power IGBTs in half-bridge configuration.
+- 2026-05-30 Switched primary reference from Russian community schematic to
+  Panasonic Service CD schematic (more authoritative). Corrected CN701 pin
+  numbering to match Panasonic's convention (pin 3 = command IN, pin 1 =
+  status OUT). Noted physical wiring is correct per Panasonic schematic;
+  only numerical labels in earlier docs were swapped. Added F6645M301GP-
+  specific component value deltas observed via board photos.
 

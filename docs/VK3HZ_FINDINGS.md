@@ -161,27 +161,40 @@ These are exactly the changes in firmware commit `3128125`.
 
 ## Sources
 
-- **PRIMARY (archived in-repo):** `docs/reference/Microwave_Oven_Inverter_HV_Power_Supply.pdf`
-  *(copy from VK3HZ — see `docs/reference/README.md` for the manual
-  copy step if this file is not present yet)*
-- David Smith VK3HZ — original online PDF:
-  http://www.vk3hz.net/amps/Microwave_Oven_Inverter_HV_Power_Supply.pdf
-- Docplayer mirror (browser-viewable backup):
-  https://docplayer.net/21544207-Panasonic-microwave-oven-inverter-hv-power-supply.html
-- Community-sourced dual-IGBT schematic (archived in-repo):
-  `docs/reference/Panasonic_Inverter_Schematic_Annotated.pdf`
-- electronicshelponline blog summary:
-  https://electronicshelponline.blogspot.com/2018/11/panasonic-microwave-oven-nn-s550wf.html
-- Companion: tomtechtod9200 YouTube reverse-engineering of F66459X91AP:
-  https://www.youtube.com/watch?v=LZb6v0JMOuU
-- Panasonic Tech Guide for Inverter Microwaves:
-  https://media.datatail.com/docs/manual/371449_en.pdf
-- NN-SD798S service manual (sister Latin America 120V variant, F606Y8M00AP):
+**Primary references (archived in-repo, used as authoritative):**
+
+- **`docs/reference/Panasonic_ServiceCD_Schematic.png`** — Panasonic's own
+  schematic of the HV inverter PSU from the Panasonic Service CD. Most
+  authoritative non-proprietary reference for the topology and component
+  values. Reproduced in the VK3HZ PDF below.
+- **`docs/reference/Microwave_Oven_Inverter_HV_Power_Supply.pdf`** —
+  David Smith VK3HZ's writeup including the Panasonic schematic plus
+  bench measurements of operational behavior (the 220 Hz / 110 Hz /
+  30 kHz signal characterization, power tables, constant-power analysis).
+
+**Supplementary references (lower priority):**
+
+- `docs/reference/Panasonic_Inverter_Schematic_Annotated.pdf` — Russian
+  community reverse-engineering. Contains some errors; use only when
+  Panasonic schematic doesn't have enough detail.
+
+**Original online sources** (for citation; project doesn't depend on
+these staying online):
+
+- VK3HZ PDF: http://www.vk3hz.net/amps/Microwave_Oven_Inverter_HV_Power_Supply.pdf
+- Docplayer mirror: https://docplayer.net/21544207-Panasonic-microwave-oven-inverter-hv-power-supply.html
+- electronicshelponline blog: https://electronicshelponline.blogspot.com/2018/11/panasonic-microwave-oven-nn-s550wf.html
+- tomtechtod9200 YouTube (F66459X91AP RE): https://www.youtube.com/watch?v=LZb6v0JMOuU
+- Panasonic Tech Guide for Inverter Microwaves: https://media.datatail.com/docs/manual/371449_en.pdf
+
+**Related Panasonic service manuals** (no schematic, but useful for
+test procedures and parts cross-reference):
+
+- NN-SD798S (Latin America 120V single-IGBT F606Y8M00AP):
   https://www.csportal.panasonic-la.com/DESCARGASPLA/PLA/ELECTRODO/MICROONDAS/INVERTER/NN-SD798SRPH/MANUAL%20DE%20SERVICIO/sd798s_rph.pdf
-- NN-GD376S service manual (related 230V dual-IGBT, F606YM300BP):
-  https://www.manualslib.com/manual/801129/Panasonic-Nn-Gd376s.html (browser only)
-  https://elektrotanya.com/panasonic_nn-gd376s.zip/download.html (alt mirror)
-- NN-ST657S service manual (closest match for F6645M301GP family):
+- NN-GD376S (230V dual-IGBT F606YM300BP):
+  https://www.manualslib.com/manual/801129/Panasonic-Nn-Gd376s.html
+- NN-ST657S (closest match for F6645M301GP family):
   https://www.manualslib.com/manual/1871563/Panasonic-Nn-St657s.html
 
 **Attribution:** The VK3HZ document is copyright David Smith VK3HZ
