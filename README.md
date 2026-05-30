@@ -56,8 +56,21 @@ AND wrong voltage (230 V vs 120 V). Ironically these are the higher-power 240 V
 boards that were actually wanted — accidentally the right thing.
 
 - **Driver: `panasonic_dual_igbt_esp32s3/`**
-- **Devices:** big switch **Toshiba GT50N322A** (1000 V / 50 A, FRD built in);
-  small switch **Toshiba GT35J321** (600 V / 35 A). Half-bridge topology.
+- **Devices (original, both OBSOLETE):** big switch **Toshiba GT50J327**
+  (intact); small switch **Toshiba GT35J321** (600 V / 35 A, the one that pops).
+  Half-bridge topology.
+- **Replacement IGBTs (Infineon TRENCHSTOP RC-H5, designed for inverterized
+  microwave ovens / induction cooking, TO-247-3pin, monolithic body diode,
+  8–60 kHz switching range):**
+  - Big switch position → **IHW40N120R5** (1200 V / 40 A, BV min 1350 V)
+  - Small switch position → **IHW30N120R5** (1200 V / 30 A, BV min 1350 V)
+  - Voltage headroom on the small switch goes from 600 V → 1200 V, structurally
+    eliminating the overvoltage-avalanche failure mode (candidate #3 below).
+  - Bought 4× of each from Mouser → 4 rebuilds / tuning-casualty budget.
+  - Keep ASYMMETRIC per Panasonic's original design (40 A big + 30 A small).
+    Do NOT use 2× 30 A (big switch undersized at 30 A vs. resonant tank current)
+    and do not "upgrade" to 2× 40 A on first attempt — it changes dead-time
+    margin against shoot-through.
 - **Controller IC:** Panasonic **AN47054A** class (undocumented). Runs closed-loop
   off DC-link / resonant-voltage / input-current sensing; generates the
   20–40 kHz IGBT gate switching itself. CN701 takes the LOW-FREQ ~220 Hz command,
@@ -73,7 +86,8 @@ boards that were actually wanted — accidentally the right thing.
 **240 V CONFIRMATION (multiple independent sources):**
 - Every parts listing cross-refs F6645M301GP to **230 V ovens**: NN-GT548M,
   NN-GD376S/GD576M, NN-GS, NN-K series (EU/Asia/Australia). No US 120 V model.
-- Big IGBT GT50N322A = **1000 V**.
+- Big IGBT GT50J327 = high-voltage Toshiba "J" series (now obsolete; replaced
+  with IHW40N120R5 = 1200 V).
 - Bridge rectifier = **D20SB80 = 800 V / 560 V RMS / 20 A** — built for a 230 V
   line (RMS ~240 V, peak ~340 V). A 120 V board would use a ~400 V bridge.
 - At 120 V input → bus only ~163 V (measured) = half of the ~325–340 V it needs
@@ -110,12 +124,17 @@ large heatsink):** more likely one of:
   1. **Current limiting on the 240 V feed** (so a bad signal trips, not detonates
      the IGBT) — variac / resistive heater element / fast fuse.
   2. **Scope on the small IGBT gate (and/or its Vce)** — to SEE shoot-through
-     (gate overlap) or overvoltage (Vce past 600 V) instead of tuning blind.
+     (gate overlap) or overvoltage (Vce — with the new IHW30N120R5's 1200 V
+     rating this is far less risky than with the original 600 V GT35J321, but
+     still scope it) instead of tuning blind.
 - Tuning procedure: start `p 40`, short 1–2 s bursts, watch gate scope + input
   current, dial up only when stable. Sweep feedback: try `sig2off` (free-run)
   vs the 110 Hz emulation, vary timing.
-- Keep spare **GT35J321** and **GT50N322A** on hand (~$5–10 ea) — IGBT casualties
-  during tuning are expected; replacing one is a 10-min job, not a reorder.
+- Spares on hand: 4× **IHW30N120R5** (small position) + 4× **IHW40N120R5** (big
+  position), Mouser, ~$5/ea. The original Toshiba GT35J321 / GT50J327 are
+  obsolete and not worth sourcing — the Infineon RC-H5 parts are the modern
+  replacement Infineon themselves market for inverterized microwave ovens.
+  Casualties during tuning are expected; replacing one is a 10-min job.
 - WHEN REPLACING A POPPED IGBT: also diode-check the partner IGBT AND the
   gate-driver components on that half-bridge leg BEFORE repowering — a shorted
   half-bridge IGBT often takes the driver/partner with it; powering into a

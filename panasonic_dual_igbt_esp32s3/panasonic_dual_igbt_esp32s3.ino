@@ -3,7 +3,9 @@
  *  ESP32-S3 Dev Module · core 2.x/3.x · 4MB · PSRAM off · USB CDC On Boot
  * ----------------------------------------------------------------------------
  *  TARGET BOARD: Panasonic F6645M301GP / "M3GP" 2-IGBT inverter
- *               (Toshiba GT50N322A big switch + small GT35J321/GT30J322),
+ *               (originally Toshiba GT50J327 big + GT35J321 small — both
+ *                obsolete; replaced with Infineon IHW40N120R5 big +
+ *                IHW30N120R5 small, both TRENCHSTOP RC-H5, 1200 V),
  *               CN701 3-pin command/feedback, CN703 HV out.
  *
  *  HOW THIS DIFFERS FROM THE SINGLE-IGBT BUILD (panasonic_inverter_esp32s3):
