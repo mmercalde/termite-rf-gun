@@ -1,129 +1,135 @@
 /* ============================================================================
- *  panasonic_dual_igbt_esp32s3.ino  —  Panasonic 2-IGBT inverter driver (EXPERIMENTAL)
+ *  panasonic_dual_igbt_esp32s3.ino  -  Panasonic 2-IGBT inverter driver
  *  ESP32-S3 Dev Module · core 2.x/3.x · 4MB · PSRAM off · USB CDC On Boot
  * ----------------------------------------------------------------------------
- *  TARGET BOARD: Panasonic F6645M301GP / "M3GP" 2-IGBT inverter
- *               (originally Toshiba GT50J327 big + GT35J321 small — both
- *                obsolete; replaced with Infineon IHW40N120R5 big +
- *                IHW30N120R5 small, both TRENCHSTOP RC-H5, 1200 V),
- *               CN701 3-pin command/feedback, CN703 HV out.
+ *  TARGET BOARD: Panasonic F6645M301GP / "M3GP" 2-IGBT inverter (240V)
+ *  ORIGINAL IGBTs (obsolete): Toshiba GT50J327 big + GT35J321 small
+ *  REPLACEMENT IGBTs:         Infineon IHW40N120R5 big + IHW30N120R5 small
+ *                             (TRENCHSTOP RC-H5, 1200V, monolithic body diode)
  *
- *  HOW THIS DIFFERS FROM THE SINGLE-IGBT BUILD (panasonic_inverter_esp32s3):
- *   The single-IGBT board ran on a flat 222Hz / 85% command from cycle one,
- *   no soft-start, pin3 tied to 1k->GND. The 2-IGBT controller is more
- *   protective: bench symptom is "press start, IGBT fires for a few ms, then
- *   the controller gates off" — identical on two boards, with both boards'
- *   IGBTs measured GOOD (E->C 0.451V, C->E OL, G-E ~42k matched). So the power
- *   stage is healthy and this is a START/COMMAND problem, not hardware.
+ *  ======================================================================
+ *  MAJOR REWRITE 2026-05-30 — incorporates VK3HZ canonical findings:
  *
- *   TWO changes vs the single-IGBT build, both grounded in the primary research
- *   (VK3HZ teardown + Panasonic service guide), targeting the ms-abort:
- *     1) SOFT-START: open at SS_DUTY (~35%) and hold SS_MS (~2s) BEFORE ramping
- *        to run power. The oven's DPC does exactly this warm-up; the 2-IGBT
- *        controller appears to require it (slamming 85% cold = instant trip).
- *     2) PIN-3 FEEDBACK (GPIO5) ENABLED BY DEFAULT: drives the 110Hz/50%
- *        phase-locked status pattern the controller may want to "see". On the
- *        single-IGBT board this wasn't needed; here it's the prime second
- *        suspect if soft-start alone doesn't sustain.
+ *  1) PIN 3 (orange) is the STATUS INPUT from the inverter, NOT a feedback
+ *     pin we drive. The inverter emits a 110Hz/50% square wave on this line
+ *     when the magnetron is warm and drawing current. We READ it, not write.
  *
- *  PRIMARY-SOURCE COMMAND FACTS (NOT the 20-40kHz myth):
- *    - CN701 pin1 command is LOW-FREQUENCY ~220Hz TTL PWM (VK3HZ scope; the
- *      teardown video's yellow trace; service manuals' "~3VAC on a meter" =
- *      averaged 220Hz square wave). The 20-40kHz is the IGBT GATE switching
- *      the board's OWN controller generates internally, NOT what CN701 takes.
- *    - pin3 = 110Hz/50% status (inverter->DPC). We emulate it on GPIO5.
+ *  2) STARTUP STATE MACHINE per VK3HZ documentation:
+ *     A) WARMUP: send 50% duty @ 222Hz, watch PIN_STATUS for 110Hz signal
+ *     B) RUN:    status seen -> drop to commanded duty per VK3HZ table
+ *     C) ABORT:  no status in STATUS_TIMEOUT_MS -> stop immediately
  *
- *  WIRING (same ESP harness as single-IGBT build — nothing to resolder):
- *    GPIO4 = PWM command out (push-pull TTL 3.3-5V) -> CN701 pin1 (YELLOW)
- *    GPIO5 = 110Hz/50% feedback emulation, OPEN-DRAIN -> CN701 pin3 (ORANGE)
- *            via 1k series. Board pulls pin3 to 5V; GPIO5 only SINKS/releases,
- *            never sources (pin3 measured 5V HIGH on start = board pull-up).
- *    GND                                            -> CN701 pin2 (BROWN)
+ *  3) MAX DUTY CAPPED AT 75% — per VK3HZ table, P100 = 75% duty.
+ *     The old "ramp to 70%" was actually equivalent to P80-P90 which is
+ *     above-spec drive. Likely cause of off-resonance overcurrent failure.
+ *
+ *  4) NO MORE sig2 OUTPUT. The previous firmware drove GPIO5 with a 110Hz
+ *     emulation pattern, which fought the inverter's own status signal on
+ *     the same line. Now GPIO5 is INPUT only.
+ *
+ *  HARDWARE CHANGE REQUIRED for safe status reading:
+ *  --------------------------------------------------
+ *  The board pulls CN701 pin 3 up to 5V via its internal pull-up. With only
+ *  a 1k series resistor (existing), GPIO5 would see ~5V on the high state,
+ *  exceeding ESP32-S3's 3.3V max input.
+ *
+ *  Add a 2.2k pulldown from GPIO5 to GND to form a voltage divider:
+ *
+ *       5V (board pull-up via ~1-2k internal)
+ *         |
+ *      pin3 -------- 1k ------- GPIO5 ----+
+ *                                         |
+ *                                        2.2k
+ *                                         |
+ *                                        GND
+ *
+ *  GPIO5 voltage when board high:  ~3.0V  (safe)
+ *  GPIO5 voltage when inverter sinks pin3 low: ~0V (safe)
+ *
+ *  If you DO NOT add the 2.2k pulldown, the status read may be unreliable
+ *  and could damage the GPIO over time. The firmware still runs — abort
+ *  detection still works on timeout — but it won't see the actual status
+ *  signal correctly until the divider is in place.
+ *
+ *  ======================================================================
+ *
+ *  WIRING (updated):
+ *    GPIO4 = PWM command out (push-pull TTL 3.3V) -> CN701 pin 1 (YELLOW)
+ *    GPIO5 = STATUS INPUT from inverter (via 1k + 2.2k divider, see above)
+ *              -> CN701 pin 3 (ORANGE)
+ *    GND                                          -> CN701 pin 2 (BROWN)
  *    GPIO7 = zero-cross in (monitor only)
- *    GPIO1 = Button1 ON/OFF ; GPIO2 = Button2 power step
  *    GPIO6 = capture tap (divider) for 'log' mode
- *
- *  SAFETY: board MUST be chassis-grounded with magnetron load + HV return
- *  intact. Bench-firing unbonded arcs from L701 to the heatsink (observed).
- *  Use a current-limited mains source and watch primary AC current.
+ *    GPIO1 = Button1 ON/OFF ; GPIO2 = Button2 power step
  *
  *  CONSOLE (115200):
- *    on / off          start (soft-start then ramp) / stop
- *    pulse <ms>        timed burst (1..30000 ms at run duty, auto-stop).
- *                      Includes soft-start if enabled; counts ms at run duty.
- *                      Safest first-use after rebuild. 'off' aborts early.
- *    p <10..95>        set RUN duty % directly
+ *    on / off          start (warmup then run, status-gated) / stop
+ *    pulse <ms>        timed burst (1..30000ms at run duty, auto-stop).
+ *                      Goes through warmup. 'off' aborts early.
+ *    p <10..75>        set RUN duty % (HARD CAP 75% per VK3HZ P100)
  *    f <hz>            set command frequency (default 222)
- *    ss <duty> <ms>    set soft-start duty% and hold time (e.g. 'ss 35 2000')
- *    ssoff / sson      disable / enable soft-start (sson = default)
- *    sig2on / sig2off  pin3 110Hz feedback on/off (ON by default here)
+ *    warmup <duty>     set warmup duty % (default 50, per VK3HZ findings)
+ *    tmo <ms>          set status-timeout ms (default 5000)
+ *    force             ignore status signal — open-loop run (DANGEROUS)
+ *    nostatus          stop trying to read status, treat as warmup-complete
+ *    statusinfo        print live status-signal edge rate
  *    log / logdump     capture mode on GPIO6
  *    zc / status / ?
  * ==========================================================================*/
 
 #include "soc/gpio_struct.h"
 
-constexpr int PIN_PWM = 4;     // command out -> CN701 pin1 (220Hz PWM)
-constexpr int PIN_SIG2 = 5;    // feedback emulation -> CN701 pin3 (110Hz/50%)
-constexpr int PIN_ZC  = 7;     // zero-cross in (monitor only)
+constexpr int PIN_PWM     = 4;   // command out -> CN701 pin1 (YELLOW)
+constexpr int PIN_STATUS  = 5;   // status IN  <- CN701 pin3 (ORANGE), via divider
+constexpr int PIN_ZC      = 7;   // zero-cross monitor
 constexpr int PIN_BTN_ONOFF = 1;
 constexpr int PIN_BTN_POWER = 2;
-constexpr int PIN_LOG = 6;     // capture tap (5V via divider)
+constexpr int PIN_LOG     = 6;   // capture tap
 
-constexpr bool INVERT_CMD = false;   // flip if higher duty gives LOWER power
+constexpr bool INVERT_CMD = false;
 
-constexpr uint32_t TICKS = 200;      // 0.5% duty resolution
-uint32_t cmdFreqHz = 222;            // 220Hz command (primary-source confirmed)
+constexpr uint32_t TICKS = 200;        // 0.5% duty resolution
+uint32_t cmdFreqHz = 222;              // 220Hz command (VK3HZ + service guide)
 int      curDuty   = 50;
 bool     running   = false;
 
-// ---- SOFT-START (the key 2-IGBT experiment) ----
-// Open at SS_DUTY for SS_MS, then ramp to run power. Mirrors the oven DPC's
-// ~2s warm-up at fixed duty before stepping to the requested power level.
-bool     softStartEn = true;         // ON by default for the 2-IGBT board
-int      ssDuty      = 35;           // warm-up duty % (well below run power)
-uint32_t ssMs        = 2000;         // warm-up hold time (ms)
-int      ssRampMs    = 800;          // ramp time from ssDuty -> run duty after hold
+// ---- VK3HZ-derived parameters ----
+// Warm-up: send 50% duty until the 110Hz status signal appears, then drop
+// to commanded duty. If status never appears within STATUS_TIMEOUT_MS, abort.
+int      warmupDuty       = 50;        // VK3HZ: oven sends 50% during warm-up
+uint32_t statusTimeoutMs  = 5000;      // 5s to see status before aborting
+
+// Max duty hard cap per VK3HZ table (P100 = 75% duty)
+constexpr int DUTY_MIN   = 10;
+constexpr int DUTY_MAX   = 75;         // WAS 95 — VK3HZ P100 = 75% duty
+
+// RUN power steps. Conservative ladder. NOTHING above 75.
+const int RUN_STEPS[] = {40, 50, 55, 60, 65, 70, 75};
+const int RUN_COUNT = sizeof(RUN_STEPS)/sizeof(RUN_STEPS[0]);
+int runIdx = 0;                        // DEFAULT 40% (lowest VK3HZ continuous)
+int curRunDuty = 40;
 
 const uint32_t FREQ_LIST[] = {110, 150, 165, 180, 200, 222, 233, 250, 280, 300};
 const int FREQ_COUNT = sizeof(FREQ_LIST)/sizeof(FREQ_LIST[0]);
-int freqIdx = 5;                     // 222Hz
-// RUN power steps (Button 2). Start conservative for the 2-IGBT board.
-const int RUN_STEPS[] = {50, 60, 70, 80, 85, 90};
-const int RUN_COUNT = sizeof(RUN_STEPS)/sizeof(RUN_STEPS[0]);
-int runIdx = 2;                      // default run power 70% (work up from here)
-int curRunDuty = 70;
-constexpr int DUTY_MIN = 10, DUTY_MAX = 95;
+int freqIdx = 5;                       // 222Hz
 
-// ---- ISR PWM + phase-locked half-frequency feedback signal ----
+// Override flags
+bool forceMode    = false;             // 'force' = ignore status, open-loop run
+bool statusBypass = false;             // 'nostatus' = skip status detection
+
+// ---- ISR PWM ----
 hw_timer_t* pwmTimer = nullptr;
 volatile uint32_t tickCounter = 0, sinkTicks = 0;
 volatile bool drvEnabled = false;
-volatile uint32_t cycleCounter = 0;
-volatile bool sig2Enabled = false;
 
 void IRAM_ATTR onPwmTick() {
-    if (!drvEnabled) { GPIO.out_w1tc = (1u<<PIN_PWM); GPIO.enable_w1tc=(1u<<PIN_SIG2); return; }
+    if (!drvEnabled) { GPIO.out_w1tc = (1u<<PIN_PWM); return; }
     tickCounter++;
-    if (tickCounter>=TICKS){ tickCounter=0; cycleCounter++; }
+    if (tickCounter >= TICKS) tickCounter = 0;
     bool on = (tickCounter < sinkTicks);
     if (INVERT_CMD) on = !on;
     if (on) GPIO.out_w1ts = (1u<<PIN_PWM);
     else    GPIO.out_w1tc = (1u<<PIN_PWM);
-    // PIN_SIG2 = pin3 feedback, OPEN-DRAIN. The board pulls pin3 up to 5V
-    // (measured: pin3 goes 5V HIGH on start). So we never SOURCE high - we
-    // SINK low for one 220Hz cycle, then RELEASE (high-Z) the next so the
-    // board's pull-up restores 5V. Result: 110Hz/50% on a 5V-pulled line.
-    // Output latch stays LOW (set once in cmdOn); we only toggle output-ENABLE.
-    //   enable bit SET  -> pin drives LOW (sink)      -> "low" half
-    //   enable bit CLEAR-> pin high-Z (INPUT)         -> board pull-up = HIGH
-    // A 1k series resistor protects the GPIO when high-Z sits at board 5V.
-    if (sig2Enabled){
-        if (cycleCounter & 1u) GPIO.enable_w1tc = (1u<<PIN_SIG2);  // release -> HIGH
-        else                   GPIO.enable_w1ts = (1u<<PIN_SIG2);  // sink   -> LOW
-    } else {
-        GPIO.enable_w1tc = (1u<<PIN_SIG2);                         // off: high-Z
-    }
 }
 
 void timerStart(uint32_t fhz) {
@@ -131,7 +137,8 @@ void timerStart(uint32_t fhz) {
     uint32_t us=1000000UL/(f*TICKS); if(us<5)us=5;
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
     if(!pwmTimer){pwmTimer=timerBegin(1000000);timerAttachInterrupt(pwmTimer,&onPwmTick);}
-    timerStop(pwmTimer);timerWrite(pwmTimer,0);timerAlarm(pwmTimer,us,true,0);timerStart(pwmTimer);
+    timerStop(pwmTimer);timerWrite(pwmTimer,0);
+    timerAlarm(pwmTimer,us,true,0);timerStart(pwmTimer);
 #else
     if(!pwmTimer){pwmTimer=timerBegin(0,80,true);timerAttachInterrupt(pwmTimer,&onPwmTick,true);}
     timerAlarmWrite(pwmTimer,us,true);timerAlarmEnable(pwmTimer);
@@ -139,12 +146,6 @@ void timerStart(uint32_t fhz) {
 }
 
 // ---- zero-cross capture (monitor only) ----
-// The detector uses a 1N4148 anti-parallel across the opto LED so the LED
-// conducts on BOTH mains half-cycles. Result: GPIO7 sees TWO rising edges
-// per full mains cycle (one near each peak), with unequal spacing due to
-// circuit asymmetry — e.g. ~5.7ms + ~10.9ms = ~16.6ms total = 60Hz.
-// To report the true mains period in zcPeriodUs, we ACCUMULATE TWO
-// consecutive intervals before publishing. That gives one full cycle.
 volatile uint32_t zcLastUs = 0, zcPeriodUs = 0;
 volatile uint32_t zcAccum = 0;
 volatile uint8_t  zcEdgeCount = 0;
@@ -153,12 +154,12 @@ constexpr uint32_t ZC_LOCKOUT_US = 4000;
 void IRAM_ATTR onZeroCross() {
     uint32_t now = micros();
     uint32_t dt = now - zcLastUs;
-    if (zcLastUs && dt < ZC_LOCKOUT_US) return;  // noise/bounce reject
+    if (zcLastUs && dt < ZC_LOCKOUT_US) return;
     if (zcLastUs) {
         zcAccum += dt;
         zcEdgeCount++;
         if (zcEdgeCount >= 2) {
-            zcPeriodUs = zcAccum;   // full mains cycle = sum of 2 half-cycle gaps
+            zcPeriodUs = zcAccum;
             zcAccum = 0;
             zcEdgeCount = 0;
         }
@@ -166,91 +167,175 @@ void IRAM_ATTR onZeroCross() {
     zcLastUs = now; zcSeen = true;
 }
 
-void setDuty(int d){ if(d<DUTY_MIN)d=DUTY_MIN; if(d>DUTY_MAX)d=DUTY_MAX; curDuty=d;
-                     sinkTicks=(uint32_t)d*TICKS/100; }
+// ---- STATUS signal detection (110Hz square wave from inverter) ----
+// Count edges on PIN_STATUS. At 110Hz/50% we expect 220 edges/second.
+// Over a 200ms window: 44 expected. If we see >= STATUS_EDGES_MIN edges,
+// signal is present (magnetron warm and oscillating).
+volatile uint32_t statusEdgeCount = 0;
+constexpr uint32_t STATUS_WINDOW_MS = 200;
+constexpr uint32_t STATUS_EDGES_MIN = 30;  // ~75Hz min (50% margin below 110Hz)
 
-void cmdOff(){ drvEnabled=false; sig2Enabled=false; sinkTicks=0;
-    GPIO.out_w1tc=(1u<<PIN_PWM);
-    GPIO.enable_w1tc=(1u<<PIN_SIG2); }              // SIG2 high-Z (released)
-void cmdOn (){ tickCounter=0; cycleCounter=0; drvEnabled=true; sig2Enabled=true;
-    GPIO.out_w1tc=(1u<<PIN_SIG2);                   // hold SIG2 output latch LOW
-    timerStart(cmdFreqHz); }                        // ISR toggles only the enable bit
-
-// ---- START with soft-start warm-up then ramp ----
-// This is the core 2-IGBT experiment. We bring the command up gently so the
-// controller's protection sees a warm-up profile rather than a cold full-duty
-// slam (which trips it in ms). Done in loop()-friendly blocking steps; safe
-// because nothing else time-critical runs during the ~3s start.
-void startRun(){
-    cmdFreqHz=FREQ_LIST[freqIdx];
-    if(softStartEn){
-        Serial.printf("[ON] soft-start: %d%% for %lums, ramp %dms -> %d%% @ %luHz (sig2=%s)\n",
-            ssDuty,(unsigned long)ssMs,ssRampMs,curRunDuty,(unsigned long)cmdFreqHz,
-            sig2Enabled?"on":"off");
-        setDuty(ssDuty);
-        cmdOn(); running=true;
-        // hold warm-up duty
-        delay(ssMs);
-        // linear ramp ssDuty -> curRunDuty
-        int steps = ssRampMs/20; if(steps<1) steps=1;
-        for(int i=1;i<=steps && running;i++){
-            int d = ssDuty + (long)(curRunDuty-ssDuty)*i/steps;
-            setDuty(d);
-            delay(20);
-        }
-        setDuty(curRunDuty);
-        Serial.printf("[ON] ramped to %d%%. BTN2/p to adjust.\n", curRunDuty);
-    } else {
-        setDuty(curRunDuty);
-        cmdOn(); running=true;
-        Serial.printf("[ON] direct %d%% @ %luHz (no soft-start). BTN2/p to adjust.\n",
-            curRunDuty,(unsigned long)cmdFreqHz);
-    }
+void IRAM_ATTR onStatusEdge() {
+    statusEdgeCount++;
 }
-void stopRun(){ cmdOff(); running=false; Serial.println("[OFF] command=0."); }
+
+// Sample the edge counter over a window, return true if signal present.
+// Non-blocking: pass elapsed window in ms, returns true if last window
+// crossed STATUS_EDGES_MIN. Reset internal accumulator each call.
+bool statusSignalLive() {
+    static uint32_t lastSampleMs = 0;
+    static uint32_t lastCount = 0;
+    uint32_t now = millis();
+    if (now - lastSampleMs < STATUS_WINDOW_MS) return false;  // not yet
+    uint32_t cur = statusEdgeCount;
+    uint32_t delta = cur - lastCount;
+    lastCount = cur;
+    lastSampleMs = now;
+    return delta >= STATUS_EDGES_MIN;
+}
+
+// Reset the status sampler (call when starting a new bring-up sequence)
+void statusSamplerReset() {
+    noInterrupts();
+    statusEdgeCount = 0;
+    interrupts();
+}
+
+// ---- duty / command primitives ----
+void setDuty(int d){
+    if(d<DUTY_MIN) d=DUTY_MIN;
+    if(d>DUTY_MAX) d=DUTY_MAX;
+    curDuty=d;
+    sinkTicks=(uint32_t)d*TICKS/100;
+}
+
+void cmdOff(){
+    drvEnabled=false; sinkTicks=0;
+    GPIO.out_w1tc=(1u<<PIN_PWM);
+}
+
+void cmdOn(){
+    tickCounter=0; drvEnabled=true;
+    timerStart(cmdFreqHz);
+}
+
+// ============================================================================
+//  STARTUP STATE MACHINE
+//  Phase A: WARMUP — send warmupDuty (50%), watch PIN_STATUS for 110Hz signal
+//  Phase B: RUN    — status seen → drop to curRunDuty, hold until stopRun
+//  Phase C: ABORT  — no status within timeout → stop, report
+//
+//  Bypasses:
+//    forceMode    — skip status detection entirely, run open-loop (DANGEROUS)
+//    statusBypass — treat warmup as immediately complete (for hardware-divider
+//                   debugging when status signal isn't readable yet)
+// ============================================================================
+
+// Returns true if startup succeeded (in RUN), false if aborted.
+// Blocking — caller decides when to return.
+bool startRun(){
+    cmdFreqHz = FREQ_LIST[freqIdx];
+
+    if(forceMode){
+        Serial.println("[ON] FORCE mode: open-loop, no status check");
+        setDuty(curRunDuty);
+        cmdOn();
+        running = true;
+        return true;
+    }
+
+    // Phase A: WARMUP
+    Serial.printf("[ON] WARMUP %d%% @ %luHz, waiting up to %lums for status signal...\n",
+                  warmupDuty, (unsigned long)cmdFreqHz, (unsigned long)statusTimeoutMs);
+    statusSamplerReset();
+    setDuty(warmupDuty);
+    cmdOn();
+    running = true;
+
+    if(statusBypass){
+        Serial.println("[ON] NOSTATUS bypass: skipping status detection, going to RUN");
+        delay(2000);  // still give magnetron filament some warm-up time
+        setDuty(curRunDuty);
+        Serial.printf("[RUN] %d%% @ %luHz (status bypassed)\n",
+                      curRunDuty, (unsigned long)cmdFreqHz);
+        return true;
+    }
+
+    // Poll for status signal
+    uint32_t deadline = millis() + statusTimeoutMs;
+    bool statusFound = false;
+    while(running && millis() < deadline){
+        if(statusSignalLive()){
+            statusFound = true;
+            break;
+        }
+        delay(5);
+    }
+
+    if(!statusFound){
+        // Phase C: ABORT
+        cmdOff();
+        running = false;
+        Serial.printf("[ABORT] no status signal in %lums.\n",
+                      (unsigned long)statusTimeoutMs);
+        Serial.println("[ABORT] check: magnetron present? mains 240V? wiring? divider on GPIO5?");
+        Serial.println("[ABORT] to bypass status check: 'nostatus' (debug) or 'force' (open-loop, risky)");
+        return false;
+    }
+
+    // Phase B: RUN
+    uint32_t warmupMs = statusTimeoutMs - (deadline - millis());
+    Serial.printf("[STATUS LIVE] magnetron oscillating after %lums warmup\n",
+                  (unsigned long)warmupMs);
+    setDuty(curRunDuty);
+    Serial.printf("[RUN] %d%% @ %luHz\n", curRunDuty, (unsigned long)cmdFreqHz);
+    return true;
+}
+
+void stopRun(){
+    cmdOff();
+    running = false;
+    Serial.println("[OFF] command=0.");
+}
 
 // Forward decl + serial buffer (declared early so pulseRun() can service serial)
 String buf;
 void handle(String c);
 
-// ---- TIMED PULSE -----------------------------------------------------------
-// Bounded burst for first-use / rebuild bring-up. Soft-start (if enabled)
-// runs as normal, THEN holds at run duty for pulseMs, THEN auto-stops.
-// Safer than 'on' because forgetting to type 'off' won't cook the IGBTs.
-// Max clamped to PULSE_MAX_MS so a typo (e.g. 'pulse 50000') can't run away.
-// User can abort early by typing 'off' (handled in handle(); breaks the loop
-// because stopRun() clears 'running').
-constexpr uint32_t PULSE_MAX_MS = 30000;   // hard 30s ceiling
+// ---- TIMED PULSE — bounded burst for bring-up ----
+constexpr uint32_t PULSE_MAX_MS = 30000;
 
 void pulseRun(uint32_t ms){
     if(ms < 1) ms = 1;
-    if(ms > PULSE_MAX_MS){ ms = PULSE_MAX_MS;
-        Serial.printf("[PULSE] clamped to max %lums\n",(unsigned long)PULSE_MAX_MS); }
-    Serial.printf("[PULSE] %lums at run duty after soft-start. 'off' aborts.\n",
+    if(ms > PULSE_MAX_MS){
+        ms = PULSE_MAX_MS;
+        Serial.printf("[PULSE] clamped to max %lums\n",(unsigned long)PULSE_MAX_MS);
+    }
+    Serial.printf("[PULSE] %lums at run duty after warmup. 'off' aborts.\n",
                   (unsigned long)ms);
-    startRun();                      // blocks through soft-start + ramp
-    if(!running) return;             // startRun aborted (shouldn't, but defensive)
+    if(!startRun()){
+        Serial.println("[PULSE] aborted during warmup, no fire");
+        return;
+    }
     uint32_t deadline = millis() + ms;
     while(running && (int32_t)(deadline - millis()) > 0){
-        // service serial so 'off' can abort; service buttons too
         while(Serial.available()){
             char ch=(char)Serial.read();
             if(ch=='\n'||ch=='\r'){ if(buf.length()){handle(buf);buf="";} }
             else if(buf.length()<32) buf+=ch;
         }
-        pollButtons();
         delay(5);
     }
     if(running){
         Serial.printf("[PULSE] %lums elapsed -> auto-stop\n",(unsigned long)ms);
         stopRun();
     } else {
-        Serial.println("[PULSE] aborted by user/fault before deadline");
+        Serial.println("[PULSE] aborted before deadline");
     }
 }
 
 // ============================================================================
-//  COMMAND-LINE LOGGER (same as single-IGBT build) — capture on GPIO6
+//  COMMAND-LINE LOGGER (capture mode for GPIO6)
 // ============================================================================
 #define LOG_MAXEDGES 8000
 #define BOOT_AUTOLOG 0
@@ -287,21 +372,6 @@ void logDump(){
     }
     Serial.flush();
     Serial.printf("---RAW END--- %lu edges\n",(unsigned long)logIdx);
-    Serial.println("---CYCLE BEGIN---");
-    Serial.println("cycle,t_start_ms,period_us,high_us,duty_high_pct");
-    uint32_t cyc=0,prevRise=0,riseT=0,highUs=0; bool sawRise=false;
-    for(uint32_t i=0;i<logIdx;i++){
-        if(logL[i]==1){
-            if(sawRise){ uint32_t per=logT[i]-prevRise;
-                if(per){ Serial.printf("%lu,%.1f,%lu,%lu,%.1f\n",(unsigned long)cyc++,
-                    (riseT-base)/1000.0,(unsigned long)per,(unsigned long)highUs,
-                    100.0*highUs/per);
-                    if((cyc & 0x1F)==0){ Serial.flush(); delay(2); } } }
-            prevRise=logT[i]; riseT=logT[i]; sawRise=true;
-        } else if(sawRise){ highUs=logT[i]-riseT; }
-    }
-    Serial.println("---CYCLE END---");
-    Serial.flush();
     Serial.println("===CAPTURE DONE===");
     Serial.flush();
 }
@@ -334,14 +404,16 @@ void pollButtons(){
     prevB1=b1; prevB2=b2;
 }
 
+// ---- handle command ----
 void handle(String c){
     c.trim(); if(!c.length()) return;
     String lc=c; lc.toLowerCase();
     if(lc=="?"||lc=="help"){
-        Serial.println(F("on off | pulse <ms> | p<10-95> | f<hz> | ss <duty> <ms> | sson ssoff"));
-        Serial.println(F("sig2on sig2off (pin3 110Hz) | log logdump | zc status"));
-        Serial.println(F("DUAL-IGBT build: soft-start ON, pin3 feedback ON by default"));
-        Serial.println(F("'pulse 500' = safest first-use; auto-stops after 500ms at run duty"));
+        Serial.println(F("on off | pulse <ms> | p<10-75> | f<hz>"));
+        Serial.println(F("warmup <duty> | tmo <ms> | force | nostatus"));
+        Serial.println(F("statusinfo | log logdump | zc status"));
+        Serial.println(F("VK3HZ MODE: warmup 50%, wait for 110Hz status, then run."));
+        Serial.println(F("Max duty 75% (VK3HZ P100). 'pulse 500' = safest first-use."));
     }
     else if(lc=="on"){ startRun(); }
     else if(lc=="off"){ stopRun(); }
@@ -350,43 +422,82 @@ void handle(String c){
         if(ms <= 0){ Serial.println("[PULSE] usage: pulse <ms>  e.g. 'pulse 500'"); }
         else { pulseRun((uint32_t)ms); }
     }
-    else if(lc=="sson"){ softStartEn=true; Serial.println("[ss] soft-start ENABLED"); }
-    else if(lc=="ssoff"){ softStartEn=false; Serial.println("[ss] soft-start DISABLED (direct drive)"); }
-    else if(lc.startsWith("ss ")){
-        int sp=c.indexOf(' '); int sp2=c.indexOf(' ',sp+1);
-        int d=c.substring(sp+1, sp2>0?sp2:c.length()).toInt();
-        if(d>0){ ssDuty=d; if(d<DUTY_MIN)ssDuty=DUTY_MIN; if(d>DUTY_MAX)ssDuty=DUTY_MAX; }
-        if(sp2>0){ long m=c.substring(sp2+1).toInt(); if(m>=0) ssMs=m; }
-        softStartEn=true;
-        Serial.printf("[ss] soft-start %d%% for %lums (ramp %dms)\n",ssDuty,(unsigned long)ssMs,ssRampMs);
+    else if(lc.startsWith("warmup")){
+        int sp = c.indexOf(' ');
+        if(sp>0){
+            int d = c.substring(sp+1).toInt();
+            if(d>=10 && d<=75){ warmupDuty=d;
+                Serial.printf("[warmup] %d%%\n", warmupDuty); }
+            else Serial.println("[warmup] usage: warmup <10..75>");
+        } else Serial.printf("[warmup] current=%d%%\n", warmupDuty);
     }
-    else if(lc=="sig2on"){ sig2Enabled=true; Serial.println("[sig2] pin3 110Hz feedback ENABLED on GPIO5"); }
-    else if(lc=="sig2off"){ sig2Enabled=false; GPIO.enable_w1tc=(1u<<PIN_SIG2); Serial.println("[sig2] DISABLED (GPIO5 high-Z / released)"); }
+    else if(lc.startsWith("tmo")){
+        int sp = c.indexOf(' ');
+        if(sp>0){
+            long m = c.substring(sp+1).toInt();
+            if(m>=500 && m<=30000){ statusTimeoutMs=m;
+                Serial.printf("[tmo] %lums\n",(unsigned long)statusTimeoutMs); }
+            else Serial.println("[tmo] usage: tmo <500..30000>");
+        } else Serial.printf("[tmo] current=%lums\n",(unsigned long)statusTimeoutMs);
+    }
+    else if(lc=="force"){ forceMode = !forceMode;
+        Serial.printf("[force] %s (open-loop, no status gate)\n",
+            forceMode?"ENABLED — DANGEROUS":"disabled"); }
+    else if(lc=="nostatus"){ statusBypass = !statusBypass;
+        Serial.printf("[nostatus] %s\n", statusBypass?"ENABLED (debug)":"disabled"); }
+    else if(lc=="statusinfo"){
+        // Quick live readout: count edges over 200ms now
+        uint32_t before = statusEdgeCount;
+        delay(200);
+        uint32_t edges = statusEdgeCount - before;
+        Serial.printf("[statusinfo] %lu edges in 200ms (~%.1fHz). %s threshold (%lu)\n",
+            (unsigned long)edges, edges*2.5,
+            edges >= STATUS_EDGES_MIN ? ">=" : "<",
+            (unsigned long)STATUS_EDGES_MIN);
+        Serial.printf("[statusinfo] PIN_STATUS instantaneous: %d\n", digitalRead(PIN_STATUS));
+    }
     else if(lc=="log"){ logArm(); }
     else if(lc=="logdump"){ logDump(); }
-    else if(lc=="status"){ Serial.printf("[status] run=%d duty=%d%% freq=%luHz ss=%d(%d%%/%lums) sig2=%d invert=%d\n",
-                            running,curDuty,(unsigned long)cmdFreqHz,softStartEn,ssDuty,
-                            (unsigned long)ssMs,sig2Enabled,INVERT_CMD); }
-    else if(lc=="zc"){ Serial.printf("[zc] period=%luus ~%.1fHz (%s)\n",
-                        (unsigned long)zcPeriodUs, zcPeriodUs?1000000.0/zcPeriodUs:0.0,
-                        zcSeen?"live":"none"); }
-    else if(lc.startsWith("p")){ int d=c.substring(1).toInt(); curRunDuty=d; setDuty(d);
-                        Serial.printf("[p] run duty=%d%% (clamped 10-95)\n",curDuty); }
-    else if(lc.startsWith("f")){ long h=c.substring(1).toInt(); if(h>0){cmdFreqHz=h; if(running)timerStart(h);
-                        Serial.printf("[f]%luHz\n",(unsigned long)cmdFreqHz);} }
+    else if(lc=="status"){
+        Serial.printf("[status] run=%d duty=%d%% freq=%luHz warmup=%d%% tmo=%lums force=%d nostatus=%d\n",
+            running, curDuty, (unsigned long)cmdFreqHz,
+            warmupDuty, (unsigned long)statusTimeoutMs,
+            forceMode, statusBypass);
+    }
+    else if(lc=="zc"){
+        Serial.printf("[zc] period=%luus ~%.1fHz (%s)\n",
+            (unsigned long)zcPeriodUs,
+            zcPeriodUs?1000000.0/zcPeriodUs:0.0,
+            zcSeen?"live":"none");
+    }
+    else if(lc.startsWith("p")){
+        int d=c.substring(1).toInt();
+        if(d > 75){
+            Serial.printf("[p] %d > 75 REJECTED — VK3HZ P100 = 75%% max\n", d);
+        } else {
+            curRunDuty=d; setDuty(d);
+            Serial.printf("[p] run duty=%d%%\n",curDuty);
+        }
+    }
+    else if(lc.startsWith("f")){
+        long h=c.substring(1).toInt();
+        if(h>0){cmdFreqHz=h; if(running)timerStart(h);
+            Serial.printf("[f]%luHz\n",(unsigned long)cmdFreqHz);}
+    }
     else Serial.println("? (try ?)");
 }
 
 void setup(){
     Serial.begin(115200);
     pinMode(PIN_PWM, OUTPUT); digitalWrite(PIN_PWM, LOW);
-    // PIN_SIG2 open-drain: preload output latch LOW, then leave pin high-Z.
-    // ISR sinks by enabling output (drives the latched LOW); releases by
-    // disabling output (INPUT -> board 5V pull-up). 1k in series protects pin.
-    pinMode(PIN_SIG2, OUTPUT); digitalWrite(PIN_SIG2, LOW);
-    GPIO.out_w1tc=(1u<<PIN_SIG2);                  // latch LOW
-    GPIO.enable_w1tc=(1u<<PIN_SIG2);               // start high-Z (released)
-    GPIO.out_w1tc=(1u<<PIN_PWM); cmdOff();
+    GPIO.out_w1tc=(1u<<PIN_PWM);
+
+    // PIN_STATUS as plain INPUT — external 2.2k pulldown forms divider with
+    // 1k series resistor against board's 5V pull-up to give safe ~3.0V hi.
+    pinMode(PIN_STATUS, INPUT);
+    attachInterrupt(PIN_STATUS, onStatusEdge, CHANGE);
+
+    cmdOff();
     pinMode(PIN_ZC, INPUT);
     attachInterrupt(PIN_ZC, onZeroCross, RISING);
     pinMode(PIN_BTN_ONOFF, INPUT_PULLUP);
@@ -394,13 +505,14 @@ void setup(){
     cmdFreqHz=FREQ_LIST[freqIdx]; curRunDuty=RUN_STEPS[runIdx]; setDuty(curRunDuty);
     delay(200);
     Serial.println("\n===============================================");
-    Serial.println(" Panasonic 2-IGBT inverter driver  (F6645M301GP / M3GP)");
-    Serial.println(" EXPERIMENTAL: soft-start + pin3 feedback to beat the ms-abort.");
-    Serial.printf ( " Start: %d%% for %lums -> ramp -> %d%% @ %luHz ; pin3 110Hz ON\n",
-                    ssDuty,(unsigned long)ssMs,curRunDuty,(unsigned long)cmdFreqHz);
-    Serial.println(" GPIO4->pin1(YELLOW) GPIO5->pin3(ORANGE) GND->pin2(BROWN)");
-    Serial.println(" 'on' to start, or 'pulse 500' for a 500ms auto-stop burst.");
-    Serial.println(" 'ss <duty> <ms>' to tune warm-up.  ? for help.");
+    Serial.println(" Panasonic 2-IGBT inverter driver (F6645M301GP / M3GP)");
+    Serial.println(" VK3HZ MODE: warmup -> wait for 110Hz status -> run");
+    Serial.printf ( " Warmup: %d%% / Run: %d%% / TMO: %lums / Freq: %luHz\n",
+        warmupDuty, curRunDuty,
+        (unsigned long)statusTimeoutMs, (unsigned long)cmdFreqHz);
+    Serial.println(" GPIO4->pin1(YELLOW)  GPIO5<-pin3(ORANGE,status)  GND->pin2");
+    Serial.println(" REQUIRED: 2.2k pulldown GPIO5->GND for safe 5V reading");
+    Serial.println(" 'on' or 'pulse 500'. 'statusinfo' to check status signal first.");
     Serial.println("===============================================");
 #if BOOT_AUTOLOG
     delay(500);
