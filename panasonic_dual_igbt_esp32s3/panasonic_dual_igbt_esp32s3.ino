@@ -49,6 +49,9 @@
  *
  *  CONSOLE (115200):
  *    on / off          start (soft-start then ramp) / stop
+ *    pulse <ms>        timed burst (1..30000 ms at run duty, auto-stop).
+ *                      Includes soft-start if enabled; counts ms at run duty.
+ *                      Safest first-use after rebuild. 'off' aborts early.
  *    p <10..95>        set RUN duty % directly
  *    f <hz>            set command frequency (default 222)
  *    ss <duty> <ms>    set soft-start duty% and hold time (e.g. 'ss 35 2000')
@@ -190,6 +193,46 @@ void startRun(){
 }
 void stopRun(){ cmdOff(); running=false; Serial.println("[OFF] command=0."); }
 
+// Forward decl + serial buffer (declared early so pulseRun() can service serial)
+String buf;
+void handle(String c);
+
+// ---- TIMED PULSE -----------------------------------------------------------
+// Bounded burst for first-use / rebuild bring-up. Soft-start (if enabled)
+// runs as normal, THEN holds at run duty for pulseMs, THEN auto-stops.
+// Safer than 'on' because forgetting to type 'off' won't cook the IGBTs.
+// Max clamped to PULSE_MAX_MS so a typo (e.g. 'pulse 50000') can't run away.
+// User can abort early by typing 'off' (handled in handle(); breaks the loop
+// because stopRun() clears 'running').
+constexpr uint32_t PULSE_MAX_MS = 30000;   // hard 30s ceiling
+
+void pulseRun(uint32_t ms){
+    if(ms < 1) ms = 1;
+    if(ms > PULSE_MAX_MS){ ms = PULSE_MAX_MS;
+        Serial.printf("[PULSE] clamped to max %lums\n",(unsigned long)PULSE_MAX_MS); }
+    Serial.printf("[PULSE] %lums at run duty after soft-start. 'off' aborts.\n",
+                  (unsigned long)ms);
+    startRun();                      // blocks through soft-start + ramp
+    if(!running) return;             // startRun aborted (shouldn't, but defensive)
+    uint32_t deadline = millis() + ms;
+    while(running && (int32_t)(deadline - millis()) > 0){
+        // service serial so 'off' can abort; service buttons too
+        while(Serial.available()){
+            char ch=(char)Serial.read();
+            if(ch=='\n'||ch=='\r'){ if(buf.length()){handle(buf);buf="";} }
+            else if(buf.length()<32) buf+=ch;
+        }
+        pollButtons();
+        delay(5);
+    }
+    if(running){
+        Serial.printf("[PULSE] %lums elapsed -> auto-stop\n",(unsigned long)ms);
+        stopRun();
+    } else {
+        Serial.println("[PULSE] aborted by user/fault before deadline");
+    }
+}
+
 // ============================================================================
 //  COMMAND-LINE LOGGER (same as single-IGBT build) — capture on GPIO6
 // ============================================================================
@@ -275,17 +318,22 @@ void pollButtons(){
     prevB1=b1; prevB2=b2;
 }
 
-String buf;
 void handle(String c){
     c.trim(); if(!c.length()) return;
     String lc=c; lc.toLowerCase();
     if(lc=="?"||lc=="help"){
-        Serial.println(F("on off | p<10-95> | f<hz> | ss <duty> <ms> | sson ssoff"));
+        Serial.println(F("on off | pulse <ms> | p<10-95> | f<hz> | ss <duty> <ms> | sson ssoff"));
         Serial.println(F("sig2on sig2off (pin3 110Hz) | log logdump | zc status"));
         Serial.println(F("DUAL-IGBT build: soft-start ON, pin3 feedback ON by default"));
+        Serial.println(F("'pulse 500' = safest first-use; auto-stops after 500ms at run duty"));
     }
     else if(lc=="on"){ startRun(); }
     else if(lc=="off"){ stopRun(); }
+    else if(lc.startsWith("pulse")){
+        long ms = c.substring(5).toInt();
+        if(ms <= 0){ Serial.println("[PULSE] usage: pulse <ms>  e.g. 'pulse 500'"); }
+        else { pulseRun((uint32_t)ms); }
+    }
     else if(lc=="sson"){ softStartEn=true; Serial.println("[ss] soft-start ENABLED"); }
     else if(lc=="ssoff"){ softStartEn=false; Serial.println("[ss] soft-start DISABLED (direct drive)"); }
     else if(lc.startsWith("ss ")){
@@ -335,7 +383,8 @@ void setup(){
     Serial.printf ( " Start: %d%% for %lums -> ramp -> %d%% @ %luHz ; pin3 110Hz ON\n",
                     ssDuty,(unsigned long)ssMs,curRunDuty,(unsigned long)cmdFreqHz);
     Serial.println(" GPIO4->pin1(YELLOW) GPIO5->pin3(ORANGE) GND->pin2(BROWN)");
-    Serial.println(" 'on' to start.  'ss <duty> <ms>' to tune warm-up.  ? for help.");
+    Serial.println(" 'on' to start, or 'pulse 500' for a 500ms auto-stop burst.");
+    Serial.println(" 'ss <duty> <ms>' to tune warm-up.  ? for help.");
     Serial.println("===============================================");
 #if BOOT_AUTOLOG
     delay(500);
