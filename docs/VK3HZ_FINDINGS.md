@@ -161,18 +161,31 @@ These are exactly the changes in firmware commit `3128125`.
 
 ## Sources
 
-- David Smith VK3HZ — original PDF (preferred URL)
+- **PRIMARY (archived in-repo):** `docs/reference/Microwave_Oven_Inverter_HV_Power_Supply.pdf`
+  *(copy from VK3HZ — see `docs/reference/README.md` for the manual
+  copy step if this file is not present yet)*
+- David Smith VK3HZ — original online PDF:
   http://www.vk3hz.net/amps/Microwave_Oven_Inverter_HV_Power_Supply.pdf
-- Docplayer mirror (browser-viewable):
+- Docplayer mirror (browser-viewable backup):
   https://docplayer.net/21544207-Panasonic-microwave-oven-inverter-hv-power-supply.html
+- Community-sourced dual-IGBT schematic (archived in-repo):
+  `docs/reference/Panasonic_Inverter_Schematic_Annotated.pdf`
 - electronicshelponline blog summary:
   https://electronicshelponline.blogspot.com/2018/11/panasonic-microwave-oven-nn-s550wf.html
-- Companion: tomtechtod9200 YouTube reverse-engineering of F66459X91AP
+- Companion: tomtechtod9200 YouTube reverse-engineering of F66459X91AP:
   https://www.youtube.com/watch?v=LZb6v0JMOuU
 - Panasonic Tech Guide for Inverter Microwaves:
   https://media.datatail.com/docs/manual/371449_en.pdf
 - NN-SD798S service manual (sister Latin America 120V variant, F606Y8M00AP):
   https://www.csportal.panasonic-la.com/DESCARGASPLA/PLA/ELECTRODO/MICROONDAS/INVERTER/NN-SD798SRPH/MANUAL%20DE%20SERVICIO/sd798s_rph.pdf
-- NN-GD376S service manual (DIRECT MATCH for F6645M301GP, 240V dual-IGBT):
+- NN-GD376S service manual (related 230V dual-IGBT, F606YM300BP):
   https://www.manualslib.com/manual/801129/Panasonic-Nn-Gd376s.html (browser only)
   https://elektrotanya.com/panasonic_nn-gd376s.zip/download.html (alt mirror)
+- NN-ST657S service manual (closest match for F6645M301GP family):
+  https://www.manualslib.com/manual/1871563/Panasonic-Nn-St657s.html
+
+**Attribution:** The VK3HZ document is copyright David Smith VK3HZ
+(vk3hz [at] wia.org.au). The community schematic source is unknown
+(Russian-annotated). Both are archived here for project continuity
+under fair-use reference purposes; cite the originals in any
+publication or derivative work.

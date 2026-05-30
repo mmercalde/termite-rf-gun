@@ -24,9 +24,17 @@ architecture but not the dual-IGBT topology.
 not sold in the US. The European/Asian regulatory paths (CE, VDE, BSI,
 IEC, CCC) do not require public schematic disclosure.
 
-**Conclusion:** there is no public schematic for F6645M301GP or any other
-230V dual-IGBT Panasonic inverter. The closest reference is the F606YM300BP
-service-manual data (parts list + ohmmeter check tables, but no schematic).
+**Conclusion:** there is no *official* schematic for F6645M301GP or any
+other 230V dual-IGBT Panasonic inverter. However, a community-sourced
+reverse-engineered schematic of a Panasonic universal-input (110V/220V)
+dual-IGBT inverter has been located and archived in the repo at:
+
+**`docs/reference/Panasonic_Inverter_Schematic_Annotated.pdf`**
+
+This shows the same dual-IGBT half-bridge topology and labels all key
+components by reference designator and value. See the [Component values
+from the archived schematic](#component-values-from-the-archived-schematic)
+section below for extracted values.
 
 ---
 
@@ -71,6 +79,88 @@ For testing the IGBTs in or out of circuit:
 
 Use this to verify new IGBTs before installation and to test suspected
 damage on existing boards.
+
+---
+
+## Component values from the archived schematic
+
+Extracted from `docs/reference/Panasonic_Inverter_Schematic_Annotated.pdf`
+(community reverse-engineering of a universal-input 110V/220V board with
+the same dual-IGBT topology as F6645M301GP).
+
+### Half-bridge IGBT topology
+
+The schematic confirms **dual-IGBT half-bridge** architecture:
+
+- **Q701** (low-side, bottom switch): G60N321 in the reference schematic
+  (our boards use GT50J327; both are same TO-247 series-resonant family)
+  - Gate driven by Q703/Q704/Q705 totem-pole (C2785 NPN + A1174 PNP) direct from +20V rail
+  - Simpler gate drive because it's ground-referenced
+- **Q702** (high-side, top switch): GT30J322 in the reference schematic
+  (our boards use GT35J321; both are same series-resonant family)
+  - Gate driven through R707-709 (33kΩ bleed) + R710-712 (36+11+36) + ZD703/ZD704 clamps
+  - More elaborate gate drive because it's high-side / level-shifted
+
+The asymmetry in gate drive networks explains the asymmetry in IGBT
+current ratings — high-side carries different di/dt and dv/dt stress than
+low-side, hence the smaller current rating on Q702.
+
+### Key component values (reference design)
+
+| Ref | Value | Role |
+|-----|-------|------|
+| **C701** | **0.68 µF / 500 V** | **Resonant tank capacitor** — critical for resonant frequency |
+| **C702** | 4 µF / 250 V | DC bus filter (deliberately small per VK3HZ) |
+| C703 | (small film) | Snubber |
+| **C704, C705** | 8200 pF / 3 kV | HV doubler capacitors (inside T701 assembly) |
+| C707 | 470 µF / 25 V | +20V rail bulk cap |
+| L701 | (line choke) | Mains filter |
+| CT701 | Current transformer | Input current sense → constant-power loop |
+| **R715-R717** | **4.5 kΩ 15 W** | Sand-bar wirewound bias supply (runs hot in normal operation) |
+| R722 | 270 Ω | (Bias network) |
+| R723, R721, R718, R720 | 201K, 241K, 180K, 241K | Voltage divider, AC sense |
+| R725 | 200 kΩ | (Sense pull-up) |
+| R702 | 15 kΩ | Gate-emitter clamp on Q701 (not the sand-bar) |
+| D704, D705 | 6.2 V (A6V71) | Low-voltage detect zeners |
+| ZD701, ZD702, ZD705 | (zeners) | Bias rail clamps |
+| ZD703, ZD704 | (zeners) | Q702 gate clamp |
+| D706 | LED + diode | Status feedback to IC701 |
+| R732 | 11 kΩ | IC702 LED current limit |
+| R733 | 1.5 kΩ | IC701 phototransistor pull-up |
+
+### Note on F606YM300BP/F6645M301GP value differences
+
+The archived schematic shows a universal-input board. Our 230V-only
+F6645M301GP family may use different specific values, particularly:
+
+- **C701 resonant cap**: F606YM300BP parts list shows ECWF5184N300 which
+  decodes to ~0.18 µF. The universal-input reference shows 0.68 µF /
+  500V. Different sizing optimizes for the operating voltage/frequency
+  point — but the *role* is identical.
+- **Bridge rectifier**: 230V boards need higher voltage rating
+- **Mains caps**: 230V rated parts
+
+Use the archived schematic to understand **topology and signal
+relationships**, but verify specific values against the actual board
+when needed.
+
+### Controller IC functional blocks
+
+The custom Panasonic analog ASIC (no public part number for the dual-IGBT
+generation) handles these functions, labeled in the schematic:
+
+1. **Power supply circuit low-voltage detect** (pins 2, 3, 5, 6) —
+   monitors mains/DC bus, prevents operation below threshold (this
+   is what caused trouble during 120V testing of the 230V boards)
+2. **Power control** (pins 7, 8) — accepts the duty-cycle command
+3. **Switching control** (pins 9, 15, 13, 4) — generates internal 24-40 kHz
+   IGBT drive signals
+4. **Feedback signal circuit** — receives current/voltage sense, drives
+   the constant-power regulation loop
+5. **Start control** (pins 10, 11, 12) — handles the cold-start sequence
+   and decides when to assert the 110 Hz status signal
+6. **CN701 interface** (pins 14, 13, 1, 4 → IC701/IC702 optos) — opto-
+   isolated boundary to the DPC
 
 ---
 
@@ -219,17 +309,20 @@ This proves three things relevant to us:
 
 ---
 
-## What we do NOT have
+## What we still do NOT have
 
-- Actual schematic of F6645M301GP (or any 230V Panasonic dual-IGBT board)
-- Schematic of the IC801-equivalent controller IC on these boards
-- Documented gate-drive network values for the dual-IGBT half-bridge
-- Snubber component values
-- Resonant tank operating frequency specification (estimated 24-40 kHz
-  per LG patents and VK3HZ for single-IGBT, but Panasonic dual-IGBT
-  may differ)
-- Definitive part number for Q702 (Panasonic only lists Q701 in the
-  F606YM300BP parts list — Q702 entry is blank)
+- Actual Panasonic-issued schematic of F6645M301GP specifically (closest
+  is the community-reverse-engineered universal-input schematic now
+  archived in `docs/reference/`)
+- Schematic of the IC801-equivalent controller IC on the dual-IGBT
+  generation (the functional blocks are labeled but the internal die
+  is proprietary)
+- Specific F6645M301GP resonant tank operating frequency (estimated
+  24-40 kHz per LG patents and VK3HZ universal-input data, but exact
+  frequency unconfirmed for our boards)
+- Definitive part number for Q702 in F606YM300BP parts list (Panasonic
+  left it blank in their own documentation)
+- Snubber component values for the 230V variant specifically
 
 These would have to be reverse-engineered from a known-good physical
 board if we ever need definitive answers.
@@ -240,4 +333,7 @@ board if we ever need definitive answers.
 
 - 2026-05-30 Initial creation, gathered after IGBT failures on
   Frankenboard built from two damaged donor boards.
+- 2026-05-30 Added archived community schematic reference (universal-input
+  dual-IGBT), extracted component values and gate-drive topology details.
+  Confirmed both Q701 and Q702 are power IGBTs in half-bridge configuration.
 
