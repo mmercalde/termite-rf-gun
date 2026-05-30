@@ -139,14 +139,30 @@ void timerStart(uint32_t fhz) {
 }
 
 // ---- zero-cross capture (monitor only) ----
+// The detector uses a 1N4148 anti-parallel across the opto LED so the LED
+// conducts on BOTH mains half-cycles. Result: GPIO7 sees TWO rising edges
+// per full mains cycle (one near each peak), with unequal spacing due to
+// circuit asymmetry — e.g. ~5.7ms + ~10.9ms = ~16.6ms total = 60Hz.
+// To report the true mains period in zcPeriodUs, we ACCUMULATE TWO
+// consecutive intervals before publishing. That gives one full cycle.
 volatile uint32_t zcLastUs = 0, zcPeriodUs = 0;
+volatile uint32_t zcAccum = 0;
+volatile uint8_t  zcEdgeCount = 0;
 volatile bool zcSeen = false;
 constexpr uint32_t ZC_LOCKOUT_US = 4000;
 void IRAM_ATTR onZeroCross() {
     uint32_t now = micros();
     uint32_t dt = now - zcLastUs;
-    if (zcLastUs && dt < ZC_LOCKOUT_US) return;
-    if (zcLastUs) zcPeriodUs = dt;
+    if (zcLastUs && dt < ZC_LOCKOUT_US) return;  // noise/bounce reject
+    if (zcLastUs) {
+        zcAccum += dt;
+        zcEdgeCount++;
+        if (zcEdgeCount >= 2) {
+            zcPeriodUs = zcAccum;   // full mains cycle = sum of 2 half-cycle gaps
+            zcAccum = 0;
+            zcEdgeCount = 0;
+        }
+    }
     zcLastUs = now; zcSeen = true;
 }
 
