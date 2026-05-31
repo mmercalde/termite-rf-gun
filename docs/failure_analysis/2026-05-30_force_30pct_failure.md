@@ -89,17 +89,24 @@ dangerous behaviors identified in the previous post-mortem:
 
 And yet Q701 still died.
 
-## Asymmetric failure pattern across all three Frankenboard events
+## Asymmetric failure pattern across the IGBT-replacement events
 
 | Failure | Q701 outcome | Q702 outcome | Drive conditions |
 |---------|--------------|--------------|------------------|
-| Original donor damage | (unknown what failed first) | (both eventually dead) | Pre-project history |
-| May 2026 (pulse 500) | Catastrophic short | Survived | Old firmware, 70% duty, 500 ms, status corruption |
-| 2026-05-30 (force 30%) | Catastrophic short | Survived | New firmware, 30% duty, seconds, no corruption |
+| Original donor damage (pre-project) | Failed | **Failed** | Pre-project history, both IGBTs needed replacement |
+| May 2026 (pulse 500, replacement IGBTs) | Catastrophic short | Survived | Old firmware, 70% duty, 500 ms, status corruption |
+| 2026-05-30 (force 30%, second replacement Q701) | Catastrophic short | Survived | New firmware, 30% duty, seconds, no corruption |
 
-**Q702 has survived every failure event.** Q701 dies. Three events, same
-asymmetric pattern. This is not random IGBT weakness — it's something
-specific to the Q701 (low-side) position on this board.
+After the original donor-event failure both IGBTs needed replacement. In
+the two subsequent failure events on this Frankenboard with replacement
+IGBTs installed, the pattern has been asymmetric: **Q701 (low-side) dies,
+Q702 (high-side) survives**, regardless of which Q701 part (Infineon
+IHW40N120R5 first event, Toshiba GT50J327 second event) is installed.
+
+Two replacement events, same asymmetric outcome, different drive
+conditions. This is not random IGBT weakness — it's something specific
+to the Q701 position on this board that has manifested consistently
+since the donor-event original failure.
 
 ## What this rules out
 
