@@ -14,14 +14,15 @@
  *     pin we drive. The inverter emits a 110Hz/50% square wave on this line
  *     when the magnetron is warm and drawing current. We READ it, not write.
  *
- *  2) STARTUP STATE MACHINE per VK3HZ documentation:
- *     A) WARMUP: send 50% duty @ 222Hz, watch PIN_STATUS for 110Hz signal
- *     B) RUN:    status seen -> drop to commanded duty per VK3HZ table
- *     C) ABORT:  no status in STATUS_TIMEOUT_MS -> stop immediately
+ *  2) STARTUP — follows VK3HZ_FINDINGS.md (230V board). Drive the run duty
+ *     (default 75% HIGH @ 222Hz = VK3HZ P100) from cycle one, no soft-start;
+ *     the inverter's own current loop handles inrush. Watch PIN_STATUS for the
+ *     110Hz signal, declare RUN once seen, ABORT if it never appears.
  *
- *  3) MAX DUTY CAPPED AT 75% — per VK3HZ table, P100 = 75% duty.
- *     The old "ramp to 70%" was actually equivalent to P80-P90 which is
- *     above-spec drive. Likely cause of off-resonance overcurrent failure.
+ *  3) RUN DUTY = 75%, CAP 75% (VK3HZ: P100 = 75%, >75% over-drives). NOTE the
+ *     ~85% figure from our 120V personal-oven capture does NOT apply here:
+ *     duty isn't voltage-portable on a constant-power inverter (120V needs more
+ *     on-time, 240V less). 222Hz/polarity/no-soft-start transfer; duty doesn't.
  *
  *  4) NO MORE sig2 OUTPUT. The previous firmware drove GPIO5 with a 110Hz
  *     emulation pattern, which fought the inverter's own status signal on
@@ -63,15 +64,13 @@
  *    GPIO1 = Button1 ON/OFF ; GPIO2 = Button2 power step
  *
  *  CONSOLE (115200):
- *    on / off          start (warmup then run, status-gated) / stop
- *    pulse <ms>        timed burst (1..30000ms at run duty, auto-stop).
- *                      Goes through warmup. 'off' aborts early.
- *    p <10..75>        set RUN duty % (HARD CAP 75% per VK3HZ P100)
+ *    on / off          start (drive run duty, status-gated) / stop
+ *    pulse <ms>        timed burst (1..30000ms at run duty, auto-stop). 'off' aborts.
+ *    p <10..75>        set RUN duty % (default 75 = VK3HZ P100; cap 75)
  *    f <hz>            set command frequency (default 222)
- *    warmup <duty>     set warmup duty % (default 50, per VK3HZ findings)
  *    tmo <ms>          set status-timeout ms (default 5000)
- *    force             ignore status signal — open-loop run (DANGEROUS)
- *    nostatus          stop trying to read status, treat as warmup-complete
+ *    force             ignore status — open-loop run (proven single-IGBT path)
+ *    nostatus          skip status detection, treat strike as complete
  *    statusinfo        print live status-signal edge rate
  *    log / logdump     capture mode on GPIO6
  *    zc / status / ?
@@ -89,25 +88,43 @@ constexpr int PIN_LOG     = 6;   // capture tap
 constexpr bool INVERT_CMD = false;
 
 constexpr uint32_t TICKS = 200;        // 0.5% duty resolution
-uint32_t cmdFreqHz = 222;              // 220Hz command (VK3HZ + service guide)
-int      curDuty   = 50;
+uint32_t cmdFreqHz = 222;              // 222Hz command — COMMON to 120V and 240V boards
+int      curDuty   = 75;
 bool     running   = false;
 
-// ---- VK3HZ-derived parameters ----
-// Warm-up: send 50% duty until the 110Hz status signal appears, then drop
-// to commanded duty. If status never appears within STATUS_TIMEOUT_MS, abort.
-int      warmupDuty       = 50;        // VK3HZ: oven sends 50% during warm-up
+// ---- VERIFIED startup parameters (per VK3HZ_FINDINGS.md) ----
+// VK3HZ characterized a Panasonic NN-S550WF — a 230V (Australian) board, so
+// his duty table is the VOLTAGE-MATCHED reference for our 240V F6645 boards.
+//
+// What transfers from our own 120V bench capture (captures/oven_run1.txt) is
+// ARCHITECTURE ONLY, not duty magnitude:
+//   * 222 Hz command period (4509us)         -> COMMON to both voltages
+//   * active-high polarity, more HIGH = power -> INVERT_CMD = false
+//   * NO soft-start ramp; DPC commands the run duty from cycle one and the
+//     inverter's own current loop handles magnetron inrush
+// Duty does NOT transfer: constant-power means a 120V board needs more on-time
+// (~85%) to reach full power, a 240V board reaches it at LESS on-time. Using
+// the 120V 85% on a 240V board would be genuine over-drive.
+//
+// So duty magnitudes come from VK3HZ's 230V table:
+//   P40=33  P50=33  P60=40  P70=55  P80=62  P90=69  P100=75   (% HIGH duty)
+//   "P100 = 75%. Anything above 75% is over-driving the inverter."
+//
+// Startup (kept): drive the run duty from cycle one, watch the 110Hz status
+// line, declare RUN only once the magnetron is oscillating, ABORT if status
+// never appears (no-load protection for the constant-power loop). For P50+
+// (our regime) VK3HZ shows continuous drive at the run value — no separate
+// warmup duty. We never drive the status line.
 uint32_t statusTimeoutMs  = 5000;      // 5s to see status before aborting
 
-// Max duty hard cap per VK3HZ table (P100 = 75% duty)
 constexpr int DUTY_MIN   = 10;
-constexpr int DUTY_MAX   = 75;         // WAS 95 — VK3HZ P100 = 75% duty
+constexpr int DUTY_MAX   = 75;         // VK3HZ: P100 = 75%, >75% is over-driving
 
-// RUN power steps. Conservative ladder. NOTHING above 75.
-const int RUN_STEPS[] = {40, 50, 55, 60, 65, 70, 75};
+// RUN power steps (% HIGH duty) = VK3HZ continuous P-levels P40..P100.
+const int RUN_STEPS[] = {33, 40, 55, 62, 69, 75};
 const int RUN_COUNT = sizeof(RUN_STEPS)/sizeof(RUN_STEPS[0]);
-int runIdx = 0;                        // DEFAULT 40% (lowest VK3HZ continuous)
-int curRunDuty = 40;
+int runIdx = 5;                        // DEFAULT 75% == VK3HZ P100
+int curRunDuty = 75;
 
 const uint32_t FREQ_LIST[] = {110, 150, 165, 180, 200, 222, 233, 250, 280, 300};
 const int FREQ_COUNT = sizeof(FREQ_LIST)/sizeof(FREQ_LIST[0]);
@@ -220,15 +237,17 @@ void cmdOn(){
 }
 
 // ============================================================================
-//  STARTUP STATE MACHINE
-//  Phase A: WARMUP — send warmupDuty (50%), watch PIN_STATUS for 110Hz signal
-//  Phase B: RUN    — status seen → drop to curRunDuty, hold until stopRun
+//  STARTUP STATE MACHINE (VERIFIED — no soft-start)
+//  Phase A: STRIKE — drive curRunDuty (default 75% = VK3HZ P100) from cycle
+//                    PIN_STATUS for the 110Hz signal (magnetron drawing current)
+//  Phase B: RUN    — status seen → hold curRunDuty until stopRun
 //  Phase C: ABORT  — no status within timeout → stop, report
 //
 //  Bypasses:
-//    forceMode    — skip status detection entirely, run open-loop (DANGEROUS)
-//    statusBypass — treat warmup as immediately complete (for hardware-divider
-//                   debugging when status signal isn't readable yet)
+//    forceMode    — skip status detection entirely, run open-loop. This is the
+//                   proven single-IGBT path; use it if the status divider on
+//                   GPIO5 isn't wired (e.g. ORANGE tied to GND through 1k).
+//    statusBypass — treat strike as immediately complete (divider-debug only)
 // ============================================================================
 
 // Returns true if startup succeeded (in RUN), false if aborted.
@@ -244,18 +263,19 @@ bool startRun(){
         return true;
     }
 
-    // Phase A: WARMUP
-    Serial.printf("[ON] WARMUP %d%% @ %luHz, waiting up to %lums for status signal...\n",
-                  warmupDuty, (unsigned long)cmdFreqHz, (unsigned long)statusTimeoutMs);
+    // Phase A: STRIKE — drive the run duty from cycle one (NO soft-start, per
+    // captured oven command). Inverter's own current loop handles inrush. We
+    // hold this same duty and wait for the 110Hz status signal to confirm the
+    // magnetron has struck and is drawing current.
+    Serial.printf("[ON] driving %d%% @ %luHz from cycle one, waiting up to %lums for status...\n",
+                  curRunDuty, (unsigned long)cmdFreqHz, (unsigned long)statusTimeoutMs);
     statusSamplerReset();
-    setDuty(warmupDuty);
+    setDuty(curRunDuty);
     cmdOn();
     running = true;
 
     if(statusBypass){
-        Serial.println("[ON] NOSTATUS bypass: skipping status detection, going to RUN");
-        delay(2000);  // still give magnetron filament some warm-up time
-        setDuty(curRunDuty);
+        Serial.println("[ON] NOSTATUS bypass: skipping status detection, treating as RUN");
         Serial.printf("[RUN] %d%% @ %luHz (status bypassed)\n",
                       curRunDuty, (unsigned long)cmdFreqHz);
         return true;
@@ -283,11 +303,11 @@ bool startRun(){
         return false;
     }
 
-    // Phase B: RUN
-    uint32_t warmupMs = statusTimeoutMs - (deadline - millis());
-    Serial.printf("[STATUS LIVE] magnetron oscillating after %lums warmup\n",
-                  (unsigned long)warmupMs);
-    setDuty(curRunDuty);
+    // Phase B: RUN — status confirms the magnetron struck. We're already at
+    // run duty (drove it from cycle one), so just confirm and hold.
+    uint32_t strikeMs = statusTimeoutMs - (deadline - millis());
+    Serial.printf("[STATUS LIVE] magnetron oscillating after %lums\n",
+                  (unsigned long)strikeMs);
     Serial.printf("[RUN] %d%% @ %luHz\n", curRunDuty, (unsigned long)cmdFreqHz);
     return true;
 }
@@ -410,10 +430,10 @@ void handle(String c){
     String lc=c; lc.toLowerCase();
     if(lc=="?"||lc=="help"){
         Serial.println(F("on off | pulse <ms> | p<10-75> | f<hz>"));
-        Serial.println(F("warmup <duty> | tmo <ms> | force | nostatus"));
+        Serial.println(F("tmo <ms> | force | nostatus"));
         Serial.println(F("statusinfo | log logdump | zc status"));
-        Serial.println(F("VK3HZ MODE: warmup 50%, wait for 110Hz status, then run."));
-        Serial.println(F("Max duty 75% (VK3HZ P100). 'pulse 500' = safest first-use."));
+        Serial.println(F("VK3HZ: 75% @ 222Hz from cycle one, wait for 110Hz status, run."));
+        Serial.println(F("Cap 75% (VK3HZ P100; >75% over-drives). 'pulse 500' = bounded first-fire."));
     }
     else if(lc=="on"){ startRun(); }
     else if(lc=="off"){ stopRun(); }
@@ -421,15 +441,6 @@ void handle(String c){
         long ms = c.substring(5).toInt();
         if(ms <= 0){ Serial.println("[PULSE] usage: pulse <ms>  e.g. 'pulse 500'"); }
         else { pulseRun((uint32_t)ms); }
-    }
-    else if(lc.startsWith("warmup")){
-        int sp = c.indexOf(' ');
-        if(sp>0){
-            int d = c.substring(sp+1).toInt();
-            if(d>=10 && d<=75){ warmupDuty=d;
-                Serial.printf("[warmup] %d%%\n", warmupDuty); }
-            else Serial.println("[warmup] usage: warmup <10..75>");
-        } else Serial.printf("[warmup] current=%d%%\n", warmupDuty);
     }
     else if(lc.startsWith("tmo")){
         int sp = c.indexOf(' ');
@@ -459,9 +470,9 @@ void handle(String c){
     else if(lc=="log"){ logArm(); }
     else if(lc=="logdump"){ logDump(); }
     else if(lc=="status"){
-        Serial.printf("[status] run=%d duty=%d%% freq=%luHz warmup=%d%% tmo=%lums force=%d nostatus=%d\n",
+        Serial.printf("[status] run=%d duty=%d%% freq=%luHz tmo=%lums force=%d nostatus=%d\n",
             running, curDuty, (unsigned long)cmdFreqHz,
-            warmupDuty, (unsigned long)statusTimeoutMs,
+            (unsigned long)statusTimeoutMs,
             forceMode, statusBypass);
     }
     else if(lc=="zc"){
@@ -472,8 +483,8 @@ void handle(String c){
     }
     else if(lc.startsWith("p")){
         int d=c.substring(1).toInt();
-        if(d > 75){
-            Serial.printf("[p] %d > 75 REJECTED — VK3HZ P100 = 75%% max\n", d);
+        if(d > DUTY_MAX){
+            Serial.printf("[p] %d > %d REJECTED (VK3HZ P100 = %d%%, >cap over-drives)\n", d, DUTY_MAX, DUTY_MAX);
         } else {
             curRunDuty=d; setDuty(d);
             Serial.printf("[p] run duty=%d%%\n",curDuty);
@@ -505,14 +516,14 @@ void setup(){
     cmdFreqHz=FREQ_LIST[freqIdx]; curRunDuty=RUN_STEPS[runIdx]; setDuty(curRunDuty);
     delay(200);
     Serial.println("\n===============================================");
-    Serial.println(" Panasonic 2-IGBT inverter driver (F6645M301GP / M3GP)");
-    Serial.println(" VK3HZ MODE: warmup -> wait for 110Hz status -> run");
-    Serial.printf ( " Warmup: %d%% / Run: %d%% / TMO: %lums / Freq: %luHz\n",
-        warmupDuty, curRunDuty,
+    Serial.println(" Panasonic 2-IGBT inverter driver (F6645M family, 240V)");
+    Serial.println(" VERIFIED: drive run duty from cycle one -> wait 110Hz status -> run");
+    Serial.printf ( " Run: %d%% / TMO: %lums / Freq: %luHz (no soft-start)\n",
+        curRunDuty,
         (unsigned long)statusTimeoutMs, (unsigned long)cmdFreqHz);
-    Serial.println(" GPIO4->pin1(YELLOW)  GPIO5<-pin3(ORANGE,status)  GND->pin2");
-    Serial.println(" REQUIRED: 2.2k pulldown GPIO5->GND for safe 5V reading");
-    Serial.println(" 'on' or 'pulse 500'. 'statusinfo' to check status signal first.");
+    Serial.println(" GPIO4->YELLOW(cmd)  GPIO5<-ORANGE(status,via divider)  GND->BROWN");
+    Serial.println(" REQUIRED for status read: 1k series + ~1k pulldown on GPIO5");
+    Serial.println(" 'on' or 'pulse 500'. 'force' = open-loop (proven single-IGBT path).");
     Serial.println("===============================================");
 #if BOOT_AUTOLOG
     delay(500);
