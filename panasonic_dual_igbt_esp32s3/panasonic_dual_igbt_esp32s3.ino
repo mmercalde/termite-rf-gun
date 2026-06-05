@@ -77,8 +77,29 @@
  * ==========================================================================*/
 
 #include "soc/gpio_struct.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <math.h>
 
-constexpr int PIN_PWM     = 4;   // command out -> CN701 pin1 (YELLOW)
+// ---- WiFi AP (self-hosted, no router — for off-grid bench use) ----
+// Join SSID 'TermiteRF' (pass 'magnetron'), browse to http://192.168.4.1/
+// The PWM runs on a hardware-timer ISR, INDEPENDENT of WiFi — so a dropped
+// web packet (e.g. RF hiccup at strike) does NOT drop the command to the
+// inverter. The web link only sets parameters and start/stop.
+const char* AP_SSID = "TermiteRF";
+const char* AP_PASS = "magnetron";       // must be >= 8 chars
+WebServer   server(80);
+
+// ---- web / remote-control state ----
+bool     webControlled    = false;       // current run was started from the web UI
+uint32_t lastWebContactMs = 0;           // updated each /state poll (keep-alive)
+bool     deadmanOn        = false;        // auto-off if web contact lost (OFF by default
+                                          // so a WiFi hiccup at strike can't abort a run)
+uint32_t deadmanSec       = 15;           // grace period before deadman auto-off
+uint32_t maxRunSec        = 60;           // HARD cap: web runs auto-off after this
+uint32_t runStartMs       = 0;            // when the current run began
+volatile uint32_t statusHzX10 = 0;        // measured status-line edge rate x10 (feedback)
+
 constexpr int PIN_STATUS  = 5;   // status IN  <- CN701 pin3 (ORANGE), via divider
 constexpr int PIN_ZC      = 7;   // zero-cross monitor
 constexpr int PIN_BTN_ONOFF = 1;
@@ -243,20 +264,29 @@ void setDuty(int d){
 }
 
 // ---- Captured-profile playback (the 120V oven command that actually struck) ----
-// Recorded oven_run1.txt: 221.8 Hz (4509us period), HIGH ~85% during warmup
-// then ~87.5% sustained. Reproduced EXACTLY with 167 ticks x 27us = 4509us:
-//   warmup: 142 HIGH / 25 LOW  -> 3834us/675us  (85.0%)
-//   run:    146 HIGH / 21 LOW  -> 3942us/567us  (87.4%)
-// GPIO5 stays READ-ONLY; this is open-loop (no status gate), matching how the
-// 120V board was actually driven. No drop to low duty — capture never went low.
-constexpr uint32_t PB_TICK_US   = 27;
-constexpr uint32_t PB_PERIOD    = 167;
-constexpr uint32_t PB_WARM_HIGH = 142;   // ~85.0% HIGH
-constexpr uint32_t PB_RUN_HIGH  = 146;   // ~87.4% HIGH
-uint32_t pbWarmupMs = 4000;              // hold warmup this long, then go to run
+// Recorded oven_run1.txt: 221.8 Hz (4509us period), HIGH ~85% warmup -> ~87.5%
+// sustained. Reproduced with PB_PERIOD ticks; tick_us derived from pbFreqHz so
+// the period is accurate (no integer-frequency truncation). All ADJUSTABLE live
+// (serial or web). GPIO5 stays READ-ONLY; open-loop, no status gate.
+constexpr uint32_t PB_PERIOD = 167;      // ticks/period -> 0.6% duty resolution
+float    pbFreqHz   = 221.8f;            // proven recorded frequency
+float    pbWarmPct  = 85.0f;             // warmup HIGH % (captured)
+float    pbRunPct   = 87.5f;             // sustained HIGH % (captured)
+uint32_t pbWarmupMs = 4000;              // hold warmup this long, then step to run
 bool     playbackActive = false;
 bool     pbInRun = false;
 uint32_t pbStartMs = 0;
+
+// tick period (us) for the chosen playback frequency, and HIGH-ticks for a duty %
+uint32_t pbTickUs(){
+    float f = pbFreqHz; if(f<50) f=50; if(f>400) f=400;
+    long u = lroundf(1000000.0f/(f*PB_PERIOD)); if(u<1) u=1; return (uint32_t)u;
+}
+uint32_t pbTicks(float pct){
+    if(pct<10) pct=10; if(pct>95) pct=95;          // clamp; never 0 or 100% (no off-time)
+    long t = lroundf(pct/100.0f*PB_PERIOD);
+    if(t<1) t=1; if(t>=(long)PB_PERIOD) t=PB_PERIOD-1; return (uint32_t)t;
+}
 
 void cmdOff(){
     drvEnabled=false; sinkTicks=0;
@@ -271,17 +301,17 @@ void cmdOn(){
 }
 
 bool startPlayback(){
-    // open-loop playback of the captured 120V command profile
+    // open-loop playback of the captured 120V command profile (adjustable params)
     periodTicks = PB_PERIOD;
-    sinkTicks   = PB_WARM_HIGH;
-    curDuty     = (int)(PB_WARM_HIGH*100/PB_PERIOD);   // ~85 for status echo
+    sinkTicks   = pbTicks(pbWarmPct);
+    curDuty     = (int)lroundf(pbWarmPct);
     tickCounter = 0; drvEnabled = true;
-    timerStartUs(PB_TICK_US);
+    timerStartUs(pbTickUs());
     playbackActive = true; pbInRun = false; pbStartMs = millis();
-    running = true;
-    Serial.printf("[PLAY] captured 120V profile @221.8Hz: warmup %u/%u ticks (~85%% HIGH), "
-                  "hold %lums, then ~87.5%% sustained. GPIO5 read-only. 'off' to stop.\n",
-                  PB_WARM_HIGH, PB_PERIOD, (unsigned long)pbWarmupMs);
+    running = true; runStartMs = millis();
+    Serial.printf("[PLAY] %.1fHz: warmup %.1f%% hold %lums -> run %.1f%% sustained. "
+                  "GPIO5 read-only, open-loop. 'off' to stop.\n",
+                  pbFreqHz, pbWarmPct, (unsigned long)pbWarmupMs, pbRunPct);
     return true;
 }
 
@@ -364,6 +394,7 @@ bool startRun(){
 void stopRun(){
     cmdOff();
     running = false;
+    webControlled = false;
     Serial.println("[OFF] command=0.");
 }
 
@@ -458,7 +489,7 @@ unsigned long lastB1=0, lastB2=0;
 constexpr unsigned long DEBOUNCE_MS=200;
 int prevB1=HIGH, prevB2=HIGH;
 
-void btnOnOff(){ if(running) stopRun(); else startRun(); }
+void btnOnOff(){ if(running) stopRun(); else startPlayback(); }
 void btnPower(){
     runIdx=(runIdx+1)%RUN_COUNT;
     curRunDuty=RUN_STEPS[runIdx];
@@ -557,14 +588,150 @@ void handle(String c){
     else Serial.println("? (try ?)");
 }
 
+// ============================================================================
+//  WiFi AP web UI  —  adjustable params + live feedback, PWM unaffected
+// ============================================================================
+const char PAGE[] PROGMEM = R"HTML(
+<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Termite RF</title><style>
+body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;padding:14px}
+h2{margin:.2em 0}.card{background:#1c1c1c;border:1px solid #333;border-radius:10px;padding:12px;margin:10px 0}
+.row{display:flex;justify-content:space-between;align-items:center;margin:6px 0}
+input[type=number]{width:90px;background:#222;color:#eee;border:1px solid #444;border-radius:6px;padding:6px}
+button{font-size:1.05em;border:0;border-radius:10px;padding:14px;margin:4px 0;width:100%;color:#fff;cursor:pointer}
+.play{background:#1f7a3f}.stop{background:#a11;font-size:1.4em;padding:20px}.apply{background:#2563a8}
+.k{color:#9af}.v{font-weight:600}.big{font-size:1.3em}
+label{display:flex;justify-content:space-between;align-items:center;margin:6px 0}
+small{color:#888}
+</style></head><body>
+<h2>Termite RF — inverter control</h2>
+<div class=card>
+ <div class=row><span class=k>State</span><span class="v big" id=mode>—</span></div>
+ <div class=row><span class=k>Duty</span><span class=v id=duty>—</span></div>
+ <div class=row><span class=k>Freq</span><span class=v id=freq>—</span></div>
+ <div class=row><span class=k>Status 110Hz</span><span class=v id=shz>—</span></div>
+ <div class=row><span class=k>Run time</span><span class=v id=rt>—</span></div>
+</div>
+<button class=play onclick="go('/play')">PLAY  (warmup &rarr; run)</button>
+<button class=stop onclick="go('/off')">STOP</button>
+<div class=card>
+ <h3>Adjust</h3>
+ <label>Freq (Hz)<input type=number id=i_freq step=0.1></label>
+ <label>Warmup %<input type=number id=i_warm step=0.1></label>
+ <label>Run %<input type=number id=i_run step=0.1></label>
+ <label>Warmup hold (ms)<input type=number id=i_wms step=100></label>
+ <label>Dead-man auto-off<input type=checkbox id=i_dm></label>
+ <label>Dead-man (s)<input type=number id=i_dms></label>
+ <label>Max run (s)<input type=number id=i_mr></label>
+ <button class=apply onclick="apply()">Apply</button>
+ <small>Dead-man off = WiFi hiccup won't abort a run (good for tuning). Max-run always caps web runs.</small>
+</div>
+<script>
+function go(u){fetch(u).then(refresh)}
+function apply(){
+ let q='/set?freq='+v('i_freq')+'&warm='+v('i_warm')+'&run='+v('i_run')
+  +'&warmms='+v('i_wms')+'&deadman='+(document.getElementById('i_dm').checked?1:0)
+  +'&dmsec='+v('i_dms')+'&maxrun='+v('i_mr');
+ fetch(q).then(refresh);
+}
+function v(id){return document.getElementById(id).value}
+function refresh(){fetch('/state').then(r=>r.json()).then(s=>{
+ mode.textContent=s.mode.toUpperCase(); mode.style.color=s.run?'#5d5':'#888';
+ duty.textContent=s.duty+' %'; freq.textContent=s.freq+' Hz';
+ shz.textContent=s.shz+' Hz '+(s.spresent?'PRESENT':'absent');
+ rt.textContent=s.run?(s.rt+' s'):'—';
+ if(document.activeElement.tagName!='INPUT'){
+  i_freq.value=s.freq;i_warm.value=s.warm;i_run.value=s.runp;i_wms.value=s.wms;
+  i_dm.checked=s.dm;i_dms.value=s.dms;i_mr.value=s.mr;}
+})}
+setInterval(refresh,1000); refresh();
+</script></body></html>
+)HTML";
+
+const char* modeStr(){
+    if(!running) return "idle";
+    if(playbackActive) return pbInRun ? "run" : "warmup";
+    if(forceMode) return "force";
+    return "run";
+}
+
+void handleRoot(){ server.send_P(200,"text/html",PAGE); }
+
+void handleState(){
+    lastWebContactMs = millis();                       // keep-alive
+    uint32_t rt = running ? (millis()-runStartMs)/1000 : 0;
+    bool spresent = (statusHzX10 >= 750);              // ~75Hz+ => status live
+    char j[420];
+    snprintf(j,sizeof(j),
+      "{\"run\":%d,\"mode\":\"%s\",\"duty\":%d,\"freq\":%.1f,"
+      "\"warm\":%.1f,\"runp\":%.1f,\"wms\":%lu,\"shz\":%.1f,\"spresent\":%d,"
+      "\"rt\":%lu,\"dm\":%d,\"dms\":%lu,\"mr\":%lu}",
+      running?1:0, modeStr(), curDuty, pbFreqHz,
+      pbWarmPct, pbRunPct, (unsigned long)pbWarmupMs,
+      statusHzX10/10.0, spresent?1:0,
+      (unsigned long)rt, deadmanOn?1:0,(unsigned long)deadmanSec,(unsigned long)maxRunSec);
+    server.send(200,"application/json",j);
+}
+
+void handleSet(){
+    if(server.hasArg("freq"))   pbFreqHz   = server.arg("freq").toFloat();
+    if(server.hasArg("warm"))   pbWarmPct  = server.arg("warm").toFloat();
+    if(server.hasArg("run"))    pbRunPct   = server.arg("run").toFloat();
+    if(server.hasArg("warmms")){ long m=server.arg("warmms").toInt(); if(m>=0&&m<=20000) pbWarmupMs=m; }
+    if(server.hasArg("deadman")) deadmanOn = server.arg("deadman").toInt()!=0;
+    if(server.hasArg("dmsec")){ long s=server.arg("dmsec").toInt(); if(s>=3&&s<=120) deadmanSec=s; }
+    if(server.hasArg("maxrun")){ long s=server.arg("maxrun").toInt(); if(s>=3&&s<=600) maxRunSec=s; }
+    // live-apply duty if a playback is already running
+    if(playbackActive){ sinkTicks = pbTicks(pbInRun?pbRunPct:pbWarmPct); curDuty=(int)lroundf(pbInRun?pbRunPct:pbWarmPct); }
+    Serial.printf("[SET] freq=%.1f warm=%.1f run=%.1f wms=%lu dm=%d dms=%lu maxrun=%lu\n",
+        pbFreqHz,pbWarmPct,pbRunPct,(unsigned long)pbWarmupMs,deadmanOn?1:0,
+        (unsigned long)deadmanSec,(unsigned long)maxRunSec);
+    server.send(200,"text/plain","ok");
+}
+
+void setupWeb(){
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASS);
+    server.on("/", handleRoot);
+    server.on("/state", handleState);
+    server.on("/set", handleSet);
+    server.on("/play", [](){ startPlayback(); webControlled=true; runStartMs=millis();
+                             lastWebContactMs=millis(); server.send(200,"text/plain","ok"); });
+    server.on("/off",  [](){ stopRun(); server.send(200,"text/plain","ok"); });
+    server.begin();
+    Serial.printf("[WiFi] AP '%s' (pass '%s')  ->  http://192.168.4.1/\n", AP_SSID, AP_PASS);
+}
+
+// safety + status-rate sampling, called from loop()
+void webTick(){
+    server.handleClient();
+    // sample status edge rate every 500ms -> Hz (110Hz/50% = 220 edges/s)
+    static uint32_t lastS=0, lastEdges=0;
+    uint32_t now=millis();
+    if(now-lastS>=500){
+        uint32_t e=statusEdgeCount; uint32_t d=e-lastEdges; lastEdges=e;
+        float hz = (d/ (float)(now-lastS) *1000.0f)/2.0f;   // edges/s /2 = Hz
+        statusHzX10 = (uint32_t)lroundf(hz*10.0f);
+        lastS=now;
+    }
+    // safety auto-off (web-initiated runs only; attended serial/button runs unaffected)
+    if(running && webControlled){
+        if(maxRunSec>0 && (now-runStartMs) > maxRunSec*1000UL){
+            stopRun(); Serial.println("[SAFE] max-run reached -> OFF"); }
+        else if(deadmanOn && (now-lastWebContactMs) > deadmanSec*1000UL){
+            stopRun(); Serial.println("[SAFE] deadman: lost web contact -> OFF"); }
+    }
+}
+
 void setup(){
     Serial.begin(115200);
     pinMode(PIN_PWM, OUTPUT); digitalWrite(PIN_PWM, LOW);
     GPIO.out_w1tc=(1u<<PIN_PWM);
 
-    // PIN_STATUS as plain INPUT — external 2.2k pulldown forms divider with
-    // 1k series resistor against board's 5V pull-up to give safe ~3.0V hi.
-    pinMode(PIN_STATUS, INPUT);
+    // PIN_STATUS read-only. INPUT_PULLDOWN so a DISCONNECTED status line can't
+    // float and fire spurious edge interrupts (esp. under RF). With the external
+    // 1k/1k divider connected, the ~45k internal pulldown is negligible.
+    pinMode(PIN_STATUS, INPUT_PULLDOWN);
     attachInterrupt(PIN_STATUS, onStatusEdge, CHANGE);
 
     cmdOff();
@@ -589,6 +756,7 @@ void setup(){
     Serial.println("[AUTOLOG] capture build. cat /dev/ttyACM0 > run.txt");
     logArm();
 #endif
+    setupWeb();   // AP 'TermiteRF' / http://192.168.4.1/ — untethered control
 }
 
 void loop(){
@@ -600,15 +768,16 @@ void loop(){
     pollButtons();
     // captured-profile playback: after the warmup hold, step from ~85% to ~87.5%
     if(playbackActive && !pbInRun && (millis()-pbStartMs) >= pbWarmupMs){
-        sinkTicks = PB_RUN_HIGH;
-        curDuty   = (int)(PB_RUN_HIGH*100/PB_PERIOD);
+        sinkTicks = pbTicks(pbRunPct);
+        curDuty   = (int)lroundf(pbRunPct);
         pbInRun   = true;
-        Serial.printf("[PLAY] warmup done (%lums) -> run ~87.5%% HIGH sustained\n",
-                      (unsigned long)pbWarmupMs);
+        Serial.printf("[PLAY] warmup done (%lums) -> run %.1f%% HIGH sustained\n",
+                      (unsigned long)pbWarmupMs, pbRunPct);
     }
     if(logArmed && logIdx>=LOG_MAXEDGES){ Serial.println("[log] buffer full."); logDump(); }
     if(logArmed && logIdx>0 && (micros()-logFirstUs) > LOG_WINDOW_MS*1000UL){
         Serial.println("[log] window elapsed."); logDump();
     }
+    webTick();        // serve web UI + status-rate sampling + safety auto-off
     delay(2);
 }
