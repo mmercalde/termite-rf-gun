@@ -5,11 +5,20 @@ Captured 2026-05-30 from David Smith VK3HZ's original PDF
 
 Hosted locally in repo because the canonical URL is intermittently unavailable.
 
-Source PSU: Panasonic NN-S550WF (circa-2000, single-IGBT family).
-The findings apply across the Panasonic inverter family — F606Y-series
-(single-IGBT) and F6645-series (dual-IGBT, 240V) share the same DPC↔inverter
-command interface architecture per author's note and the
-tomtechtod9200 YouTube reverse-engineering of F66459X91AP.
+See also `docs/reference/sources_and_official_docs.md` for the official Panasonic
+Technical Training Manual, the avdweb contactless HV test, and why no official
+drive-signal spec exists.
+
+Source PSU: Panasonic NN-S550WF (circa-2000). NOTE: earlier revisions of this
+file called it "single-IGBT" — that is WRONG. The board is a TWO-IGBT
+half-bridge: Q701 (GT60N90, main switch) + Q702 (GT30J322, second/flywheel
+device) — the same half-bridge resonant topology as the F6645-series. The
+findings therefore apply across the Panasonic inverter family — F606Y-series
+and F6645-series (dual-IGBT, 240V) share the same half-bridge architecture and
+the same DPC↔inverter command interface — per the author's note, the avdweb
+re-engineering (which explicitly calls it "a half-bridge converter of 1000W"),
+and the tomtechtod9200 YouTube RE of the F66459X91AP (dual-IGBT). The "dual vs
+single IGBT" distinction is NOT a reason to treat VK3HZ's data as inapplicable.
 
 ---
 
@@ -140,10 +149,15 @@ Translation: Panasonic acknowledged the original IGBT was undersized AND
 that gate timing needed adjustment. The control-cap change (~6× smaller
 capacitance) means faster gate switching.
 
-For your F6645M301GP (240V dual-IGBT), the originals are GT50J327 +
-GT35J321 — same architectural pattern but higher-voltage class. Modern
-Infineon TRENCHSTOP RC-H5 replacements (IHW40N120R5 + IHW30N120R5) are
-even better — 1200 V, designed for soft-switching inverters.
+For your F6645M-series (240V dual-IGBT), bench inspection of the factory boards
+shows the originals are **GT50N322 (1000V/50A, big/low-side) + GT35J321
+(600V/35A, smaller/high-side)** — NOT the "GT50J327" earlier listed here. That
+correction matters: the 600V GT50J327 was a Frankenboard *repair* part, and a
+600V device in the resonant-switch (low-side) position — where the switch node
+swings well above the ~340V bus — is a leading suspect for the repeated Q701
+deaths. The factory boards ship with the correct 1000V part. Modern Infineon
+TRENCHSTOP RC-H5 (IHW40N120R5 + IHW30N120R5, 1200V) are a further upgrade if a
+replacement is ever needed.
 
 ## Implications for our standalone firmware (TL;DR)
 
