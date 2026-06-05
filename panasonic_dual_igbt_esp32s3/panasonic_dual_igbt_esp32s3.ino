@@ -100,6 +100,7 @@ uint32_t maxRunSec        = 60;           // HARD cap: web runs auto-off after t
 uint32_t runStartMs       = 0;            // when the current run began
 volatile uint32_t statusHzX10 = 0;        // measured status-line edge rate x10 (feedback)
 
+constexpr int PIN_PWM     = 4;   // command out -> CN701 pin1 (YELLOW)
 constexpr int PIN_STATUS  = 5;   // status IN  <- CN701 pin3 (ORANGE), via divider
 constexpr int PIN_ZC      = 7;   // zero-cross monitor
 constexpr int PIN_BTN_ONOFF = 1;
