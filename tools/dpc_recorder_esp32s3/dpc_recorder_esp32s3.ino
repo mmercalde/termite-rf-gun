@@ -33,8 +33,11 @@ constexpr int PIN_CMD = 6;    // COMMAND   <- CN701 pin 3 (via 1k/1k divider)
 constexpr int PIN_BTN = 0;    // BOOT button (arm without serial)
 
 // ~30 s of cold-start with retries fits easily. Each edge = 6 bytes.
-#define MAXEDGES   20000
+#define MAXEDGES   30000
 #define WINDOW_MS  30000UL
+// Real command/feedback edges are never closer than ~565us (narrowest notch at
+// 87.5% duty). Anything closer is ringing/noise pickup, not signal. Reject it.
+#define GLITCH_US  200UL
 
 volatile uint32_t edgeT[MAXEDGES];   // micros() timestamp
 volatile uint8_t  edgeC[MAXEDGES];   // channel: 0=CMD, 1=FB
@@ -42,22 +45,28 @@ volatile uint8_t  edgeL[MAXEDGES];   // level after edge
 volatile uint32_t idx = 0;
 volatile bool     armed = false;
 volatile uint32_t firstUs = 0;
+volatile uint32_t lastCmdUs = 0, lastFbUs = 0;   // per-channel last-edge time
+volatile uint32_t droppedCmd = 0, droppedFb = 0; // glitch-rejected counts
 
 void IRAM_ATTR onCmd(){
     if(!armed || idx>=MAXEDGES) return;
     uint32_t t=micros();
+    if(lastCmdUs && (t-lastCmdUs) < GLITCH_US){ droppedCmd++; return; }  // glitch
+    lastCmdUs=t;
     if(idx==0) firstUs=t;
     edgeT[idx]=t; edgeC[idx]=0; edgeL[idx]=(uint8_t)digitalRead(PIN_CMD); idx++;
 }
 void IRAM_ATTR onFb(){
     if(!armed || idx>=MAXEDGES) return;
     uint32_t t=micros();
+    if(lastFbUs && (t-lastFbUs) < GLITCH_US){ droppedFb++; return; }      // glitch
+    lastFbUs=t;
     if(idx==0) firstUs=t;
     edgeT[idx]=t; edgeC[idx]=1; edgeL[idx]=(uint8_t)digitalRead(PIN_FB); idx++;
 }
 
 void arm(){
-    idx=0; firstUs=0; armed=true;
+    idx=0; firstUs=0; lastCmdUs=0; lastFbUs=0; droppedCmd=0; droppedFb=0; armed=true;
     Serial.println("[REC] ARMED — listening on GPIO6(CMD) + GPIO5(FB). Press microwave START.");
 }
 
@@ -84,6 +93,8 @@ void dump(){
     Serial.printf("---REC END--- %lu edges  (CMD=%lu  FB=%lu)  span=%lu ms\n",
         (unsigned long)idx,(unsigned long)cN,(unsigned long)fN,
         (unsigned long)((edgeT[idx-1]-base)/1000));
+    Serial.printf("    glitches rejected: CMD=%lu FB=%lu (sub-%luus noise)\n",
+        (unsigned long)droppedCmd,(unsigned long)droppedFb,(unsigned long)GLITCH_US);
     Serial.println("===CAPTURE DONE===");
     Serial.flush();
 }
