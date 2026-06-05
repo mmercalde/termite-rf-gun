@@ -137,16 +137,32 @@ bool statusBypass = false;             // 'nostatus' = skip status detection
 // ---- ISR PWM ----
 hw_timer_t* pwmTimer = nullptr;
 volatile uint32_t tickCounter = 0, sinkTicks = 0;
+volatile uint32_t periodTicks = TICKS;   // ticks per command period (200 normally;
+                                         // 167 in captured-profile playback)
 volatile bool drvEnabled = false;
 
 void IRAM_ATTR onPwmTick() {
     if (!drvEnabled) { GPIO.out_w1tc = (1u<<PIN_PWM); return; }
     tickCounter++;
-    if (tickCounter >= TICKS) tickCounter = 0;
+    if (tickCounter >= periodTicks) tickCounter = 0;
     bool on = (tickCounter < sinkTicks);
     if (INVERT_CMD) on = !on;
     if (on) GPIO.out_w1ts = (1u<<PIN_PWM);
     else    GPIO.out_w1tc = (1u<<PIN_PWM);
+}
+
+// Start the timer with an EXPLICIT per-tick microsecond value (no freq truncation).
+// Used by captured-profile playback so the period is exact (167 ticks x 27us = 4509us).
+void timerStartUs(uint32_t us) {
+    if(us<1) us=1;
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    if(!pwmTimer){pwmTimer=timerBegin(1000000);timerAttachInterrupt(pwmTimer,&onPwmTick);}
+    timerStop(pwmTimer);timerWrite(pwmTimer,0);
+    timerAlarm(pwmTimer,us,true,0);timerStart(pwmTimer);
+#else
+    if(!pwmTimer){pwmTimer=timerBegin(0,80,true);timerAttachInterrupt(pwmTimer,&onPwmTick,true);}
+    timerAlarmWrite(pwmTimer,us,true);timerAlarmEnable(pwmTimer);
+#endif
 }
 
 void timerStart(uint32_t fhz) {
@@ -223,17 +239,50 @@ void setDuty(int d){
     if(d<DUTY_MIN) d=DUTY_MIN;
     if(d>DUTY_MAX) d=DUTY_MAX;
     curDuty=d;
-    sinkTicks=(uint32_t)d*TICKS/100;
+    sinkTicks=(uint32_t)d*periodTicks/100;
 }
+
+// ---- Captured-profile playback (the 120V oven command that actually struck) ----
+// Recorded oven_run1.txt: 221.8 Hz (4509us period), HIGH ~85% during warmup
+// then ~87.5% sustained. Reproduced EXACTLY with 167 ticks x 27us = 4509us:
+//   warmup: 142 HIGH / 25 LOW  -> 3834us/675us  (85.0%)
+//   run:    146 HIGH / 21 LOW  -> 3942us/567us  (87.4%)
+// GPIO5 stays READ-ONLY; this is open-loop (no status gate), matching how the
+// 120V board was actually driven. No drop to low duty — capture never went low.
+constexpr uint32_t PB_TICK_US   = 27;
+constexpr uint32_t PB_PERIOD    = 167;
+constexpr uint32_t PB_WARM_HIGH = 142;   // ~85.0% HIGH
+constexpr uint32_t PB_RUN_HIGH  = 146;   // ~87.4% HIGH
+uint32_t pbWarmupMs = 4000;              // hold warmup this long, then go to run
+bool     playbackActive = false;
+bool     pbInRun = false;
+uint32_t pbStartMs = 0;
 
 void cmdOff(){
     drvEnabled=false; sinkTicks=0;
+    playbackActive=false; pbInRun=false;
+    periodTicks=TICKS;                   // restore normal duty resolution
     GPIO.out_w1tc=(1u<<PIN_PWM);
 }
 
 void cmdOn(){
     tickCounter=0; drvEnabled=true;
     timerStart(cmdFreqHz);
+}
+
+bool startPlayback(){
+    // open-loop playback of the captured 120V command profile
+    periodTicks = PB_PERIOD;
+    sinkTicks   = PB_WARM_HIGH;
+    curDuty     = (int)(PB_WARM_HIGH*100/PB_PERIOD);   // ~85 for status echo
+    tickCounter = 0; drvEnabled = true;
+    timerStartUs(PB_TICK_US);
+    playbackActive = true; pbInRun = false; pbStartMs = millis();
+    running = true;
+    Serial.printf("[PLAY] captured 120V profile @221.8Hz: warmup %u/%u ticks (~85%% HIGH), "
+                  "hold %lums, then ~87.5%% sustained. GPIO5 read-only. 'off' to stop.\n",
+                  PB_WARM_HIGH, PB_PERIOD, (unsigned long)pbWarmupMs);
+    return true;
 }
 
 // ============================================================================
@@ -429,14 +478,24 @@ void handle(String c){
     c.trim(); if(!c.length()) return;
     String lc=c; lc.toLowerCase();
     if(lc=="?"||lc=="help"){
-        Serial.println(F("on off | pulse <ms> | p<10-75> | f<hz>"));
+        Serial.println(F("on off | play | pwarm <ms> | pulse <ms> | p<10-75> | f<hz>"));
         Serial.println(F("tmo <ms> | force | nostatus"));
         Serial.println(F("statusinfo | log logdump | zc status"));
-        Serial.println(F("VK3HZ: 75% @ 222Hz from cycle one, wait for 110Hz status, run."));
-        Serial.println(F("Cap 75% (VK3HZ P100; >75% over-drives). 'pulse 500' = bounded first-fire."));
+        Serial.println(F("play = captured 120V profile (85->87.5% @221.8Hz, GPIO5 read-only)."));
+        Serial.println(F("Cap 75% on p<>; play bypasses cap (uses recorded ticks). 'pulse 500' bounded."));
     }
     else if(lc=="on"){ startRun(); }
     else if(lc=="off"){ stopRun(); }
+    else if(lc=="play"){ startPlayback(); }
+    else if(lc.startsWith("pwarm")){
+        int sp = c.indexOf(' ');
+        if(sp>0){
+            long m = c.substring(sp+1).toInt();
+            if(m>=500 && m<=20000){ pbWarmupMs=m;
+                Serial.printf("[pwarm] playback warmup hold = %lums\n",(unsigned long)pbWarmupMs); }
+            else Serial.println("[pwarm] usage: pwarm <500..20000>");
+        } else Serial.printf("[pwarm] current=%lums\n",(unsigned long)pbWarmupMs);
+    }
     else if(lc.startsWith("pulse")){
         long ms = c.substring(5).toInt();
         if(ms <= 0){ Serial.println("[PULSE] usage: pulse <ms>  e.g. 'pulse 500'"); }
@@ -539,6 +598,14 @@ void loop(){
         else if(buf.length()<32) buf+=ch;
     }
     pollButtons();
+    // captured-profile playback: after the warmup hold, step from ~85% to ~87.5%
+    if(playbackActive && !pbInRun && (millis()-pbStartMs) >= pbWarmupMs){
+        sinkTicks = PB_RUN_HIGH;
+        curDuty   = (int)(PB_RUN_HIGH*100/PB_PERIOD);
+        pbInRun   = true;
+        Serial.printf("[PLAY] warmup done (%lums) -> run ~87.5%% HIGH sustained\n",
+                      (unsigned long)pbWarmupMs);
+    }
     if(logArmed && logIdx>=LOG_MAXEDGES){ Serial.println("[log] buffer full."); logDump(); }
     if(logArmed && logIdx>0 && (micros()-logFirstUs) > LOG_WINDOW_MS*1000UL){
         Serial.println("[log] window elapsed."); logDump();
