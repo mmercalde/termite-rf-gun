@@ -264,21 +264,32 @@ void setDuty(int d){
     sinkTicks=(uint32_t)d*periodTicks/100;
 }
 
-// ---- Captured-profile playback (the 120V oven command that actually struck) ----
-// Recorded oven_run1.txt: 221.8 Hz (4509us period), HIGH ~85% warmup -> ~87.5%
-// sustained. Reproduced with PB_PERIOD ticks; tick_us derived from pbFreqHz so
-// the period is accurate (no integer-frequency truncation). All ADJUSTABLE live
-// (serial or web). GPIO5 stays READ-ONLY; open-loop, no status gate.
+// ---- CLOSED-LOOP STARTUP (per VK3HZ doc + bench scope) ----
+// Documented Panasonic behaviour: drive 222Hz at the STARTUP duty (the "50% power"
+// level = ~33% duty) UNTIL the 110Hz Status signal appears (magnetron drawing
+// current), THEN set the RUN duty. Status idles HIGH (5V) and starts TOGGLING at
+// 110Hz when the tube fires — so detection = "110Hz toggling appeared", not a
+// level. Cold tubes: if no status within the attempt window, restart and retry
+// (covers the ~12s cold-start budget seen on video).
 constexpr uint32_t PB_PERIOD = 167;      // ticks/period -> 0.6% duty resolution
-float    pbFreqHz   = 221.8f;            // proven recorded frequency
-float    pbWarmPct  = 85.0f;             // warmup HIGH % (captured)
-float    pbRunPct   = 87.5f;             // sustained HIGH % (captured)
-uint32_t pbWarmupMs = 4000;              // hold warmup this long, then step to run
+float    pbFreqHz   = 222.0f;            // command frequency (constant; duty=power)
+float    pbWarmPct  = 33.0f;             // STARTUP duty (VK3HZ 50%-power level; raise for 120V)
+float    pbRunPct   = 75.0f;             // RUN duty after status (VK3HZ 100%-power = 75%; raise for 120V)
+uint32_t pbWarmupMs = 3000;              // attempt window: drive startup duty this long awaiting status
+uint32_t pbRestartMs= 400;               // command-off gap between failed attempts
+int      pbMaxRetry = 6;                 // restart cycles before just holding startup duty
 bool     playbackActive = false;
-bool     pbInRun = false;
+bool     pbInRun = false;                // true once status seen and at RUN duty
 uint32_t pbStartMs = 0;
 
-// tick period (us) for the chosen playback frequency, and HIGH-ticks for a duty %
+// sequence state machine
+enum SeqState { SEQ_OFF, SEQ_STARTUP, SEQ_RESTART, SEQ_RUN, SEQ_HOLD };
+SeqState seqState = SEQ_OFF;
+uint32_t seqMs = 0;       // time current state entered
+int      seqRetry = 0;
+bool     statusEverSeen = false;
+
+// tick period (us) for the chosen frequency, and HIGH-ticks for a duty %
 uint32_t pbTickUs(){
     float f = pbFreqHz; if(f<50) f=50; if(f>400) f=400;
     long u = lroundf(1000000.0f/(f*PB_PERIOD)); if(u<1) u=1; return (uint32_t)u;
@@ -289,9 +300,13 @@ uint32_t pbTicks(float pct){
     if(t<1) t=1; if(t>=(long)PB_PERIOD) t=PB_PERIOD-1; return (uint32_t)t;
 }
 
+// status present = 110Hz toggling detected (band rejects idle=0Hz and HF noise)
+bool statusPresent(){ return (statusHzX10 >= 600 && statusHzX10 <= 1700); }  // 60-170Hz
+
 void cmdOff(){
     drvEnabled=false; sinkTicks=0;
     playbackActive=false; pbInRun=false;
+    seqState=SEQ_OFF;
     periodTicks=TICKS;                   // restore normal duty resolution
     GPIO.out_w1tc=(1u<<PIN_PWM);
 }
@@ -301,19 +316,71 @@ void cmdOn(){
     timerStart(cmdFreqHz);
 }
 
-bool startPlayback(){
-    // open-loop playback of the captured 120V command profile (adjustable params)
+// drive 222Hz at a given duty (used by the sequence)
+void seqDrive(float duty){
     periodTicks = PB_PERIOD;
-    sinkTicks   = pbTicks(pbWarmPct);
-    curDuty     = (int)lroundf(pbWarmPct);
+    sinkTicks   = pbTicks(duty);
+    curDuty     = (int)lroundf(duty);
     tickCounter = 0; drvEnabled = true;
     timerStartUs(pbTickUs());
-    playbackActive = true; pbInRun = false; pbStartMs = millis();
+}
+
+bool startPlayback(){
+    // begin closed-loop startup: drive startup duty, watch for 110Hz status
+    seqDrive(pbWarmPct);
+    playbackActive = true; pbInRun = false;
+    seqState = SEQ_STARTUP; seqMs = millis();
+    seqRetry = 0; statusEverSeen = false;
     running = true; runStartMs = millis();
-    Serial.printf("[PLAY] %.1fHz: warmup %.1f%% hold %lums -> run %.1f%% sustained. "
-                  "GPIO5 read-only, open-loop. 'off' to stop.\n",
-                  pbFreqHz, pbWarmPct, (unsigned long)pbWarmupMs, pbRunPct);
+    Serial.printf("[SEQ] %.0fHz startup %.0f%% -> watch 110Hz status -> run %.0f%%. "
+                  "attempt %lums, restart %lums, retries %d. 'off' to stop.\n",
+                  pbFreqHz, pbWarmPct, pbRunPct,
+                  (unsigned long)pbWarmupMs,(unsigned long)pbRestartMs, pbMaxRetry);
     return true;
+}
+
+// non-blocking sequence tick, called from loop()
+void seqTick(){
+    if(seqState==SEQ_OFF) return;
+    uint32_t now = millis();
+    bool present = statusPresent();
+    switch(seqState){
+      case SEQ_STARTUP:
+        if(present){                                   // tube struck -> go to RUN
+            statusEverSeen=true; seqDrive(pbRunPct);
+            pbInRun=true; seqState=SEQ_RUN; seqMs=now;
+            Serial.printf("[SEQ] 110Hz status SEEN -> RUN %.0f%%\n", pbRunPct);
+        } else if(now-seqMs > pbWarmupMs){             // no status in window
+            if(seqRetry < pbMaxRetry){
+                seqRetry++;
+                drvEnabled=false; GPIO.out_w1tc=(1u<<PIN_PWM);  // command off (restart)
+                seqState=SEQ_RESTART; seqMs=now;
+                Serial.printf("[SEQ] no status, restart #%d/%d\n", seqRetry, pbMaxRetry);
+            } else {
+                seqState=SEQ_HOLD; seqMs=now;          // keep driving startup, keep watching
+                Serial.println("[SEQ] retries done — holding startup duty, still watching status");
+            }
+        }
+        break;
+      case SEQ_RESTART:
+        if(now-seqMs > pbRestartMs){                   // re-arm startup drive
+            seqDrive(pbWarmPct); seqState=SEQ_STARTUP; seqMs=now;
+        }
+        break;
+      case SEQ_HOLD:                                   // exhausted retries; still watch
+        if(present){ statusEverSeen=true; seqDrive(pbRunPct); pbInRun=true;
+                     seqState=SEQ_RUN; seqMs=now;
+                     Serial.printf("[SEQ] late 110Hz status -> RUN %.0f%%\n", pbRunPct); }
+        break;
+      case SEQ_RUN:
+        // driving run duty; if status disappears for >1.5s, note it (tube dropped)
+        if(!present && (now-seqMs)>1500){
+            Serial.println("[SEQ] status lost during RUN (tube dropped?)");
+            seqState=SEQ_STARTUP; seqMs=now; seqRetry=0; pbInRun=false; seqDrive(pbWarmPct);
+        }
+        break;
+      default: break;
+    }
 }
 
 // ============================================================================
@@ -513,7 +580,7 @@ void handle(String c){
         Serial.println(F("on off | play | pwarm <ms> | pulse <ms> | p<10-75> | f<hz>"));
         Serial.println(F("tmo <ms> | force | nostatus"));
         Serial.println(F("statusinfo | log logdump | zc status"));
-        Serial.println(F("play = captured 120V profile (85->87.5% @221.8Hz, GPIO5 read-only)."));
+        Serial.println(F("play = CLOSED-LOOP: 222Hz startup duty -> watch 110Hz status -> run duty."));
         Serial.println(F("Cap 75% on p<>; play bypasses cap (uses recorded ticks). 'pulse 500' bounded."));
     }
     else if(lc=="on"){ startRun(); }
@@ -618,14 +685,14 @@ small{color:#888}
 <div class=card>
  <h3>Adjust</h3>
  <label>Freq (Hz)<input type=number id=i_freq step=0.1></label>
- <label>Warmup %<input type=number id=i_warm step=0.1></label>
- <label>Run %<input type=number id=i_run step=0.1></label>
- <label>Warmup hold (ms)<input type=number id=i_wms step=100></label>
+ <label>Startup duty %<input type=number id=i_warm step=0.1></label>
+ <label>Run duty %<input type=number id=i_run step=0.1></label>
+ <label>Attempt window (ms)<input type=number id=i_wms step=100></label>
  <label>Dead-man auto-off<input type=checkbox id=i_dm></label>
  <label>Dead-man (s)<input type=number id=i_dms></label>
  <label>Max run (s)<input type=number id=i_mr></label>
  <button class=apply onclick="apply()">Apply</button>
- <small>Dead-man off = WiFi hiccup won't abort a run (good for tuning). Max-run always caps web runs.</small>
+ <small>Startup duty held until 110Hz status seen, then Run duty. 230V: ~33%/75%. 120V: higher (~50%/85%). Watch "Status 110Hz" for strike.</small>
 </div>
 <script>
 function go(u){fetch(u).then(refresh)}
@@ -651,7 +718,13 @@ setInterval(refresh,1000); refresh();
 
 const char* modeStr(){
     if(!running) return "idle";
-    if(playbackActive) return pbInRun ? "run" : "warmup";
+    switch(seqState){
+      case SEQ_STARTUP: return "startup";
+      case SEQ_RESTART: return "restart";
+      case SEQ_RUN:     return "run";
+      case SEQ_HOLD:    return "hold";
+      default: break;
+    }
     if(forceMode) return "force";
     return "run";
 }
@@ -661,7 +734,7 @@ void handleRoot(){ server.send_P(200,"text/html",PAGE); }
 void handleState(){
     lastWebContactMs = millis();                       // keep-alive
     uint32_t rt = running ? (millis()-runStartMs)/1000 : 0;
-    bool spresent = (statusHzX10 >= 750);              // ~75Hz+ => status live
+    bool spresent = statusPresent();                   // 110Hz band (60-170Hz)
     char j[420];
     snprintf(j,sizeof(j),
       "{\"run\":%d,\"mode\":\"%s\",\"duty\":%d,\"freq\":%.1f,"
@@ -729,10 +802,11 @@ void setup(){
     pinMode(PIN_PWM, OUTPUT); digitalWrite(PIN_PWM, LOW);
     GPIO.out_w1tc=(1u<<PIN_PWM);
 
-    // PIN_STATUS read-only. INPUT_PULLDOWN so a DISCONNECTED status line can't
-    // float and fire spurious edge interrupts (esp. under RF). With the external
-    // 1k/1k divider connected, the ~45k internal pulldown is negligible.
-    pinMode(PIN_STATUS, INPUT_PULLDOWN);
+    // PIN_STATUS read-only. Plain INPUT — the external 10k/10k divider sets the
+    // level. Status line IDLES HIGH (~5V->~2.5V) from power-on and starts TOGGLING
+    // at 110Hz when the magnetron draws current; we detect the toggling (edges),
+    // not a level. (Divider MUST be connected or this floats.)
+    pinMode(PIN_STATUS, INPUT);
     attachInterrupt(PIN_STATUS, onStatusEdge, CHANGE);
 
     cmdOff();
@@ -767,14 +841,7 @@ void loop(){
         else if(buf.length()<32) buf+=ch;
     }
     pollButtons();
-    // captured-profile playback: after the warmup hold, step from ~85% to ~87.5%
-    if(playbackActive && !pbInRun && (millis()-pbStartMs) >= pbWarmupMs){
-        sinkTicks = pbTicks(pbRunPct);
-        curDuty   = (int)lroundf(pbRunPct);
-        pbInRun   = true;
-        Serial.printf("[PLAY] warmup done (%lums) -> run %.1f%% HIGH sustained\n",
-                      (unsigned long)pbWarmupMs, pbRunPct);
-    }
+    seqTick();    // closed-loop startup state machine (startup->status->run, w/ retry)
     if(logArmed && logIdx>=LOG_MAXEDGES){ Serial.println("[log] buffer full."); logDump(); }
     if(logArmed && logIdx>0 && (micros()-logFirstUs) > LOG_WINDOW_MS*1000UL){
         Serial.println("[log] window elapsed."); logDump();
