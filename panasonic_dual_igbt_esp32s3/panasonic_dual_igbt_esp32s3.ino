@@ -280,8 +280,8 @@ constexpr uint32_t PB_PERIOD = 167;      // ticks/period -> 0.6% duty resolution
 float    pbFreqHz   = 222.0f;            // command frequency (constant; duty=power)
 float    pbWarmPct  = 33.0f;             // STARTUP duty (VK3HZ "50% power" level; adjustable)
 float    pbRunPct   = 75.0f;             // RUN duty after feedback goes low (adjustable)
-uint32_t pbWarmupMs = 3000;              // attempt window: drive startup duty this long awaiting feedback LOW
-uint32_t pbRestartMs= 400;               // command-off gap between failed attempts
+uint32_t pbWarmupMs = 2500;              // attempt window: drive startup duty this long awaiting feedback LOW
+uint32_t pbRestartMs= 1500;              // command-off gap between attempts (matches manual play/stop rhythm)
 int      pbMaxRetry = 8;                 // restart cycles before holding startup (covers cold tube)
 bool     playbackActive = false;
 bool     pbInRun = false;                // true once feedback seen and at RUN duty
@@ -586,7 +586,7 @@ void handle(String c){
         Serial.println(F("on off | play | pwarm <ms> | pulse <ms> | p<10-75> | f<hz>"));
         Serial.println(F("tmo <ms> | force | nostatus"));
         Serial.println(F("statusinfo | log logdump | zc status"));
-        Serial.println(F("play = startup 33% -> RETRY until feedback pin LOW -> run 75%. [build: FBLOW-RETRY-v4]"));
+        Serial.println(F("play = startup 33% -> RETRY until feedback pin LOW -> run 75%. [build: FBLOW-RETRY-v5]"));
         Serial.println(F("Cap 75% on p<>; play bypasses cap (uses recorded ticks). 'pulse 500' bounded."));
     }
     else if(lc=="on"){ startRun(); }
