@@ -10,7 +10,7 @@
  *  ======================================================================
  *  MAJOR REWRITE 2026-05-30 — incorporates VK3HZ canonical findings:
  *
- *  1) PIN 3 (orange) is the STATUS INPUT from the inverter, NOT a feedback
+ *  1) PIN 1 is the STATUS INPUT from the inverter, NOT a feedback
  *     pin we drive. The inverter emits a 110Hz/50% square wave on this line
  *     when the magnetron is warm and drawing current. We READ it, not write.
  *
@@ -30,7 +30,7 @@
  *
  *  HARDWARE CHANGE REQUIRED for safe status reading:
  *  --------------------------------------------------
- *  The board pulls CN701 pin 3 up to 5V via its internal pull-up. With only
+ *  The board pulls CN701 pin 1 up to 5V via its internal pull-up. With only
  *  a 1k series resistor (existing), GPIO5 would see ~5V on the high state,
  *  exceeding ESP32-S3's 3.3V max input.
  *
@@ -38,14 +38,14 @@
  *
  *       5V (board pull-up via ~1-2k internal)
  *         |
- *      pin3 -------- 1k ------- GPIO5 ----+
+ *      pin1 -------- 1k ------- GPIO5 ----+
  *                                         |
  *                                        2.2k
  *                                         |
  *                                        GND
  *
  *  GPIO5 voltage when board high:  ~3.0V  (safe)
- *  GPIO5 voltage when inverter sinks pin3 low: ~0V (safe)
+ *  GPIO5 voltage when inverter sinks pin1 low: ~0V (safe)
  *
  *  If you DO NOT add the 2.2k pulldown, the status read may be unreliable
  *  and could damage the GPIO over time. The firmware still runs — abort
@@ -54,11 +54,14 @@
  *
  *  ======================================================================
  *
- *  WIRING (updated):
- *    GPIO4 = PWM command out (push-pull TTL 3.3V) -> CN701 pin 1 (YELLOW)
+ *  WIRING (pin numbers corrected 2026-06-06 — earlier comments had command and
+ *  status pins swapped; the bench wiring is correct, only the labels were wrong.
+ *  Confirmed pinout: pin1 = STATUS, pin2 = GND, pin3 = PWM command.
+ *  Verify harness wire colors on the bench — prior color tags were unreliable):
+ *    GPIO4 = PWM command out (push-pull TTL 3.3V) -> CN701 pin 3
  *    GPIO5 = STATUS INPUT from inverter (via 1k + 2.2k divider, see above)
- *              -> CN701 pin 3 (ORANGE)
- *    GND                                          -> CN701 pin 2 (BROWN)
+ *              -> CN701 pin 1
+ *    GND                                          -> CN701 pin 2
  *    GPIO7 = zero-cross in (monitor only)
  *    GPIO6 = capture tap (divider) for 'log' mode
  *    GPIO1 = Button1 ON/OFF ; GPIO2 = Button2 power step
@@ -100,8 +103,8 @@ uint32_t maxRunSec        = 60;           // HARD cap: web runs auto-off after t
 uint32_t runStartMs       = 0;            // when the current run began
 volatile uint32_t statusHzX10 = 0;        // measured status-line edge rate x10 (feedback)
 
-constexpr int PIN_PWM     = 4;   // command out -> CN701 pin1 (YELLOW)
-constexpr int PIN_STATUS  = 5;   // status IN  <- CN701 pin3 (ORANGE), via divider
+constexpr int PIN_PWM     = 4;   // command out -> CN701 pin3
+constexpr int PIN_STATUS  = 5;   // status IN  <- CN701 pin1, via divider
 constexpr int PIN_ZC      = 7;   // zero-cross monitor
 constexpr int PIN_BTN_ONOFF = 1;
 constexpr int PIN_BTN_POWER = 2;
