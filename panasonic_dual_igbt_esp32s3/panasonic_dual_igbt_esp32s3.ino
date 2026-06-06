@@ -273,21 +273,20 @@ void setDuty(int d){
 // (covers the ~12s cold-start budget seen on video).
 constexpr uint32_t PB_PERIOD = 167;      // ticks/period -> 0.6% duty resolution
 float    pbFreqHz   = 222.0f;            // command frequency (constant; duty=power)
-float    pbWarmPct  = 33.0f;             // STARTUP duty (VK3HZ 50%-power level; raise for 120V)
-float    pbRunPct   = 75.0f;             // RUN duty after status (VK3HZ 100%-power = 75%; raise for 120V)
-uint32_t pbWarmupMs = 3000;              // attempt window: drive startup duty this long awaiting status
+float    pbWarmPct  = 33.0f;             // STARTUP duty (VK3HZ "50% power" level; adjustable)
+float    pbRunPct   = 75.0f;             // RUN duty after feedback goes low (adjustable)
+uint32_t pbWarmupMs = 3000;              // attempt window: drive startup duty this long awaiting feedback LOW
 uint32_t pbRestartMs= 400;               // command-off gap between failed attempts
-int      pbMaxRetry = 6;                 // restart cycles before just holding startup duty
+int      pbMaxRetry = 8;                 // restart cycles before holding startup (covers cold tube)
 bool     playbackActive = false;
-bool     pbInRun = false;                // true once status seen and at RUN duty
+bool     pbInRun = false;                // true once feedback seen and at RUN duty
 uint32_t pbStartMs = 0;
 
 // sequence state machine
-enum SeqState { SEQ_OFF, SEQ_STARTUP, SEQ_RESTART, SEQ_RUN, SEQ_HOLD };
+enum SeqState { SEQ_OFF, SEQ_STARTUP, SEQ_RESTART, SEQ_RUN };
 SeqState seqState = SEQ_OFF;
-uint32_t seqMs = 0;       // time current state entered
+uint32_t seqMs = 0;
 int      seqRetry = 0;
-bool     statusEverSeen = false;
 
 // tick period (us) for the chosen frequency, and HIGH-ticks for a duty %
 uint32_t pbTickUs(){
@@ -299,9 +298,6 @@ uint32_t pbTicks(float pct){
     long t = lroundf(pct/100.0f*PB_PERIOD);
     if(t<1) t=1; if(t>=(long)PB_PERIOD) t=PB_PERIOD-1; return (uint32_t)t;
 }
-
-// status present = 110Hz toggling detected (band rejects idle=0Hz and HF noise)
-bool statusPresent(){ return (statusHzX10 >= 600 && statusHzX10 <= 1700); }  // 60-170Hz
 
 void cmdOff(){
     drvEnabled=false; sinkTicks=0;
@@ -316,7 +312,7 @@ void cmdOn(){
     timerStart(cmdFreqHz);
 }
 
-// drive 222Hz at a given duty (used by the sequence)
+// drive 222Hz at a given duty
 void seqDrive(float duty){
     periodTicks = PB_PERIOD;
     sinkTicks   = pbTicks(duty);
@@ -326,59 +322,58 @@ void seqDrive(float duty){
 }
 
 bool startPlayback(){
-    // begin closed-loop startup: drive startup duty, watch for 110Hz status
+    // Drive 222Hz at startup duty (pbWarmPct, default 33%). Feedback pin idles HIGH
+    // (INPUT_PULLUP); inverter pulls it LOW when the tube draws current. Watch for
+    // feedback LOW; if it doesn't come within the attempt window, restart and retry
+    // (cold tube needs a few tries — as the real DPC does). On feedback LOW -> switch
+    // to run duty (pbRunPct, default 75%). All duties/timing adjustable on web page.
     seqDrive(pbWarmPct);
     playbackActive = true; pbInRun = false;
-    seqState = SEQ_STARTUP; seqMs = millis();
-    seqRetry = 0; statusEverSeen = false;
+    seqState = SEQ_STARTUP; seqMs = millis(); seqRetry = 0;
     running = true; runStartMs = millis();
-    Serial.printf("[SEQ] %.0fHz startup %.0f%% -> watch 110Hz status -> run %.0f%%. "
-                  "attempt %lums, restart %lums, retries %d. 'off' to stop.\n",
+    Serial.printf("[SEQ] %.0fHz startup %.0f%% — retry until feedback LOW, then run %.0f%%. "
+                  "attempt %lums, restart %lums, max %d tries.\n",
                   pbFreqHz, pbWarmPct, pbRunPct,
                   (unsigned long)pbWarmupMs,(unsigned long)pbRestartMs, pbMaxRetry);
     return true;
 }
 
-// non-blocking sequence tick, called from loop()
+// feedback LOW = inverter drawing current (3 consecutive lows = real, not a glitch)
+bool feedbackLow(){
+    static uint8_t lc=0;
+    if(digitalRead(PIN_STATUS)==LOW){ if(++lc>=3){ lc=0; return true; } }
+    else lc=0;
+    return false;
+}
+
+// non-blocking: startup duty -> (retry until feedback LOW) -> run duty
 void seqTick(){
     if(seqState==SEQ_OFF) return;
     uint32_t now = millis();
-    bool present = statusPresent();
     switch(seqState){
       case SEQ_STARTUP:
-        if(present){                                   // tube struck -> go to RUN
-            statusEverSeen=true; seqDrive(pbRunPct);
-            pbInRun=true; seqState=SEQ_RUN; seqMs=now;
-            Serial.printf("[SEQ] 110Hz status SEEN -> RUN %.0f%%\n", pbRunPct);
-        } else if(now-seqMs > pbWarmupMs){             // no status in window
+        if(feedbackLow()){                              // tube struck
+            seqDrive(pbRunPct); pbInRun=true; seqState=SEQ_RUN; seqMs=now;
+            Serial.printf("[SEQ] feedback LOW -> RUN %.0f%% (try %d)\n", pbRunPct, seqRetry+1);
+        } else if(now-seqMs > pbWarmupMs){              // no strike this attempt
             if(seqRetry < pbMaxRetry){
                 seqRetry++;
-                drvEnabled=false; GPIO.out_w1tc=(1u<<PIN_PWM);  // command off (restart)
+                drvEnabled=false; GPIO.out_w1tc=(1u<<PIN_PWM);  // command off
                 seqState=SEQ_RESTART; seqMs=now;
-                Serial.printf("[SEQ] no status, restart #%d/%d\n", seqRetry, pbMaxRetry);
+                Serial.printf("[SEQ] no strike, restart #%d/%d\n", seqRetry, pbMaxRetry);
             } else {
-                seqState=SEQ_HOLD; seqMs=now;          // keep driving startup, keep watching
-                Serial.println("[SEQ] retries done — holding startup duty, still watching status");
+                seqMs=now;                              // keep driving startup, keep watching
+                Serial.println("[SEQ] max tries — holding startup duty, still watching feedback");
             }
         }
         break;
       case SEQ_RESTART:
-        if(now-seqMs > pbRestartMs){                   // re-arm startup drive
+        if(now-seqMs > pbRestartMs){                    // re-arm startup drive
             seqDrive(pbWarmPct); seqState=SEQ_STARTUP; seqMs=now;
         }
         break;
-      case SEQ_HOLD:                                   // exhausted retries; still watch
-        if(present){ statusEverSeen=true; seqDrive(pbRunPct); pbInRun=true;
-                     seqState=SEQ_RUN; seqMs=now;
-                     Serial.printf("[SEQ] late 110Hz status -> RUN %.0f%%\n", pbRunPct); }
-        break;
       case SEQ_RUN:
-        // driving run duty; if status disappears for >1.5s, note it (tube dropped)
-        if(!present && (now-seqMs)>1500){
-            Serial.println("[SEQ] status lost during RUN (tube dropped?)");
-            seqState=SEQ_STARTUP; seqMs=now; seqRetry=0; pbInRun=false; seqDrive(pbWarmPct);
-        }
-        break;
+        break;                                          // hold run duty
       default: break;
     }
 }
@@ -722,7 +717,6 @@ const char* modeStr(){
       case SEQ_STARTUP: return "startup";
       case SEQ_RESTART: return "restart";
       case SEQ_RUN:     return "run";
-      case SEQ_HOLD:    return "hold";
       default: break;
     }
     if(forceMode) return "force";
@@ -734,7 +728,7 @@ void handleRoot(){ server.send_P(200,"text/html",PAGE); }
 void handleState(){
     lastWebContactMs = millis();                       // keep-alive
     uint32_t rt = running ? (millis()-runStartMs)/1000 : 0;
-    bool spresent = statusPresent();                   // 110Hz band (60-170Hz)
+    bool spresent = (statusHzX10 >= 600 && statusHzX10 <= 1700);  // feedback toggling ~110Hz
     char j[420];
     snprintf(j,sizeof(j),
       "{\"run\":%d,\"mode\":\"%s\",\"duty\":%d,\"freq\":%.1f,"
