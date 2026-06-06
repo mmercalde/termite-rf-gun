@@ -178,9 +178,14 @@ void IRAM_ATTR onPwmTick() {
 void timerStartUs(uint32_t us) {
     if(us<1) us=1;
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
-    if(!pwmTimer){pwmTimer=timerBegin(1000000);timerAttachInterrupt(pwmTimer,&onPwmTick);}
-    timerStop(pwmTimer);timerWrite(pwmTimer,0);
-    timerAlarm(pwmTimer,us,true,0);timerStart(pwmTimer);
+    if(!pwmTimer){                          // first start only: create + attach + run
+        pwmTimer=timerBegin(1000000);
+        timerAttachInterrupt(pwmTimer,&onPwmTick);
+        timerAlarm(pwmTimer,us,true,0);
+        timerStart(pwmTimer);
+    } else {
+        timerAlarm(pwmTimer,us,true,0);     // already running: just update period
+    }
 #else
     if(!pwmTimer){pwmTimer=timerBegin(0,80,true);timerAttachInterrupt(pwmTimer,&onPwmTick,true);}
     timerAlarmWrite(pwmTimer,us,true);timerAlarmEnable(pwmTimer);
@@ -312,11 +317,16 @@ void cmdOn(){
     timerStart(cmdFreqHz);
 }
 
-// drive 222Hz at a given duty
+// change duty LIVE — the ISR reads sinkTicks every tick, so no timer touch needed
+void seqSetDuty(float duty){
+    sinkTicks = pbTicks(duty);
+    curDuty   = (int)lroundf(duty);
+}
+
+// full start: set duty and start the 222Hz timer (timer started ONCE, then left alone)
 void seqDrive(float duty){
     periodTicks = PB_PERIOD;
-    sinkTicks   = pbTicks(duty);
-    curDuty     = (int)lroundf(duty);
+    seqSetDuty(duty);
     tickCounter = 0; drvEnabled = true;
     timerStartUs(pbTickUs());
 }
@@ -353,12 +363,12 @@ void seqTick(){
     switch(seqState){
       case SEQ_STARTUP:
         if(feedbackLow()){                              // tube struck
-            seqDrive(pbRunPct); pbInRun=true; seqState=SEQ_RUN; seqMs=now;
+            seqSetDuty(pbRunPct); pbInRun=true; seqState=SEQ_RUN; seqMs=now;  // duty-only, no timer touch
             Serial.printf("[SEQ] feedback LOW -> RUN %.0f%% (try %d)\n", pbRunPct, seqRetry+1);
         } else if(now-seqMs > pbWarmupMs){              // no strike this attempt
             if(seqRetry < pbMaxRetry){
                 seqRetry++;
-                drvEnabled=false; GPIO.out_w1tc=(1u<<PIN_PWM);  // command off
+                drvEnabled=false; GPIO.out_w1tc=(1u<<PIN_PWM);  // command off (timer keeps running)
                 seqState=SEQ_RESTART; seqMs=now;
                 Serial.printf("[SEQ] no strike, restart #%d/%d\n", seqRetry, pbMaxRetry);
             } else {
@@ -368,8 +378,9 @@ void seqTick(){
         }
         break;
       case SEQ_RESTART:
-        if(now-seqMs > pbRestartMs){                    // re-arm startup drive
-            seqDrive(pbWarmPct); seqState=SEQ_STARTUP; seqMs=now;
+        if(now-seqMs > pbRestartMs){                    // re-arm: duty + enable, NO timer restart
+            seqSetDuty(pbWarmPct); tickCounter=0; drvEnabled=true;
+            seqState=SEQ_STARTUP; seqMs=now;
         }
         break;
       case SEQ_RUN:
@@ -575,7 +586,7 @@ void handle(String c){
         Serial.println(F("on off | play | pwarm <ms> | pulse <ms> | p<10-75> | f<hz>"));
         Serial.println(F("tmo <ms> | force | nostatus"));
         Serial.println(F("statusinfo | log logdump | zc status"));
-        Serial.println(F("play = CLOSED-LOOP: 222Hz startup duty -> watch 110Hz status -> run duty."));
+        Serial.println(F("play = startup 33% -> RETRY until feedback pin LOW -> run 75%. [build: FBLOW-RETRY-v4]"));
         Serial.println(F("Cap 75% on p<>; play bypasses cap (uses recorded ticks). 'pulse 500' bounded."));
     }
     else if(lc=="on"){ startRun(); }
