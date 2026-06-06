@@ -802,11 +802,13 @@ void setup(){
     pinMode(PIN_PWM, OUTPUT); digitalWrite(PIN_PWM, LOW);
     GPIO.out_w1tc=(1u<<PIN_PWM);
 
-    // PIN_STATUS read-only. Plain INPUT — the external 10k/10k divider sets the
-    // level. Status line IDLES HIGH (~5V->~2.5V) from power-on and starts TOGGLING
-    // at 110Hz when the magnetron draws current; we detect the toggling (edges),
-    // not a level. (Divider MUST be connected or this floats.)
-    pinMode(PIN_STATUS, INPUT);
+    // PIN_STATUS read-only, OPEN-COLLECTOR from the inverter's feedback opto.
+    // The inverter only PULLS THIS LINE LOW (at 110Hz when the magnetron draws
+    // current); it never drives it high. In the oven, the DPC provided the pull-up
+    // that idles the line high. We ARE the DPC now, so we must provide that pull-up:
+    // INPUT_PULLUP idles GPIO5 high (~3.3V), inverter pulls it to 0 at 110Hz = strike.
+    // Wire inverter status pin DIRECTLY to GPIO5 (NO divider — line never exceeds 3.3V).
+    pinMode(PIN_STATUS, INPUT_PULLUP);
     attachInterrupt(PIN_STATUS, onStatusEdge, CHANGE);
 
     cmdOff();
