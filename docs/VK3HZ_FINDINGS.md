@@ -79,6 +79,13 @@ Period = 1/220 Hz ≈ 4.55 ms. So "1.5 ms on" out of 4.55 ms ≈ 33% duty.
 
 ## Startup sequence (CRITICAL — this is what we were missing)
 
+> **SUPERSEDED for our standalone driver — see `docs/STARTUP_PROCEDURE.md`.**
+> The "warm-up phase = higher duty then drop" below is the OEM DPC's *low-power
+> cycling* behaviour, NOT our method. Our verified, bench-proven startup is:
+> pulse the command 1-3 s on CN701 pin 3, watch pin 1 for LOW (= strike),
+> repeat until struck, then run continuous at the desired-power duty. Status-
+> gated, which is what prevents the 30%-force-mode IGBT failure.
+
 For low-power settings (P10-P40), the DPC's behavior on START:
 
 1. **Warm-up phase**: send a HIGHER duty than the requested power level
