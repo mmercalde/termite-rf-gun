@@ -649,7 +649,7 @@ void handle(String c){
         Serial.println(F("on off | play | pwarm <ms> | pulse <ms> | p<10-75> | f<hz>"));
         Serial.println(F("tmo <ms> | force | nostatus"));
         Serial.println(F("statusinfo | log logdump | zc status"));
-        Serial.println(F("play = startup 33% -> sustained-toggle strike -> run 75%. THERMAL CUTOFF 75C. [build: FBLOW-THERM-v6]"));
+        Serial.println(F("play = startup 33% -> sustained-toggle strike -> run 75%. THERMAL CUTOFF 75C. [build: FBLOW-THERM-v7]"));
         Serial.println(F("Cap 75% on p<>; play bypasses cap (uses recorded ticks). 'pulse 500' bounded."));
     }
     else if(lc=="on"){ startRun(); }
@@ -729,7 +729,7 @@ void handle(String c){
 //  WiFi AP web UI  —  adjustable params + live feedback, PWM unaffected
 // ============================================================================
 const char PAGE[] PROGMEM = R"HTML(
-<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
+<!doctype html><html><head><meta charset="utf-8"><meta name=viewport content="width=device-width,initial-scale=1">
 <title>Termite RF</title><style>
 body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;padding:14px}
 h2{margin:.2em 0}.card{background:#1c1c1c;border:1px solid #333;border-radius:10px;padding:12px;margin:10px 0}
@@ -779,7 +779,7 @@ function refresh(){fetch('/state').then(r=>r.json()).then(s=>{
  mode.textContent=s.mode.toUpperCase(); mode.style.color=s.run?'#5d5':'#888';
  duty.textContent=s.duty+' %'; freq.textContent=s.freq+' Hz';
  shz.textContent=s.shz+' Hz '+(s.spresent?'PRESENT':'absent');
- temp.textContent=s.temp.toFixed(1)+' °C'+(s.trip?' TRIPPED':'');
+ temp.textContent=s.temp.toFixed(1)+' °C / '+(s.temp*9/5+32).toFixed(1)+' °F'+(s.trip?' TRIPPED':'');
  temp.style.color = s.trip?'#f55':(s.temp>=s.twarn?'#fa3':'#5d5');
  rpm.textContent=s.rpm+' rpm';
  zc.textContent=s.zc.toFixed(1)+' Hz';
