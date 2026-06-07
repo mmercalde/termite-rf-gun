@@ -383,6 +383,72 @@ board if we ever need definitive answers.
 
 ---
 
+## VR701 / VR1 — current-sense calibration trim (CORRECTS the CT701 model)
+
+**Bottom line:** VR701 is the factory power-calibration trim. On Michael's
+board it adjusts the GAIN of a **shunt-derived** current-sense signal into the
+controller IC. It is NOT a filament adjust, and there is NO CT701 on these
+boards — earlier notes in this file describing a "CT701 current transformer ->
+constant-power loop" are WRONG for this variant and are superseded by this
+section.
+
+### What the part is
+- Board silkscreen **VR1** = schematic **VR701**. White trimmer marked **"503"
+  = 50 kOhm** (photo-confirmed, component side). Note this is a third value in
+  the family: V-series doc = 1k, L/N-series doc = 10k, this board = 50k.
+- Physical location: cold/control side, between CN702 (above) and CN701
+  (below), in the small-signal cluster near the IC702/IC703 optos.
+- Panasonic flags it **"DO NOT ADJUST VR701"** — see the annotated board photo
+  on **page 7 of the NN-GD376S service manual** (manualslib id 801129). That
+  photo is the best physical-location reference we have for VR701, better than
+  either schematic. The "do not adjust" warning has one documented exception:
+  adjustment IS required after the HV transformer (T701) is replaced.
+
+### No CT701 — sense is a shunt
+The current sense on this board is **SHUNT R703** in the DC-bus return (read
+from the tomtechtod9200 RE schematic, confirmed by Michael: no current
+transformer present). This is why the board has no CT701. VR701 scales the
+shunt-derived sense before it reaches the controller.
+
+### Controller IC
+Named on the RE schematic as **AN47054A** (Panasonic analog ASIC, no public
+datasheet). Its internal regulation behaviour is unknown; we model only the
+passive front-end feeding it.
+
+### Sense chain (as read; assumptions flagged)
+    SHUNT R703 -> front-end -> Vsense
+    Vsense --[2k4]-- nIn --[R40 (value TBC)]-- potHi
+    VR701 50k:  potHi --(1-p)*50k-- wiper --(p)*50k-- GND
+    wiper --[100k]-- controller sense pin (~pin 13)
+
+### SPICE result (`spice/vr701_cal.py`, `spice/results/03_vr701_cal.png`)
+- Voltage at the controller sense pin is **linear** in wiper position ->
+  VR701 is a linear gain control on the current-sense signal.
+- If the chip regulates that pin to a fixed reference, the regulated current
+  (= power) setpoint is a **1/x** curve vs VR701:
+  - **more wiper -> chip reads more volts/amp -> backs off -> LOWER power**
+  - **less wiper -> under-reads -> pushes harder -> HIGHER power**
+- **Danger zone = low-wiper / high-power end** (curve is steep there; small
+  moves swing current hard -> IGBT avalanche risk). High-wiper end is flat
+  (fine, safe low-power control).
+- Shape is robust to the unknowns; absolute numbers are NOT.
+
+### Calibration procedure (after identical-T701 swap)
+1. Mark the original wiper position before touching it. Identical part -> only
+   tolerance moves -> expect a small tweak, not a full recal.
+2. If disturbed/unknown: set to the LOW-power end first, power up at low DPC
+   duty, confirm screwdriver direction vs power on the inline ammeter, then
+   bring power UP slowly toward your target current. Small nudges near max.
+3. Target = YOUR load's intended operating current at your chosen duty, NOT the
+   oven's spec'd input current (meaningless for this application).
+
+### Open items for bench confirmation
+- R40 actual value, and VR701 wiring (divider vs rheostat; where the wiper
+  truly returns).
+- Whether AN47054A regulates this pin to a fixed reference, and its value.
+- One real datapoint: measured input current at a known VR701 position + DPC
+  duty, to pin the curve's absolute scale.
+
 ## Document history
 
 - 2026-05-30 Initial creation, gathered after IGBT failures on
@@ -397,3 +463,10 @@ board if we ever need definitive answers.
   only numerical labels in earlier docs were swapped. Added F6645M301GP-
   specific component value deltas observed via board photos.
 
+- 2026-06-07 Added VR701/VR1 section. CORRECTED: no CT701 on these boards;
+  current sense is SHUNT R703 (DC-bus return). VR701 = 50k "503" trimmer =
+  current-sense GAIN calibration into AN47054A controller (named from RE
+  schematic). Added SPICE model (spice/vr701_cal.py) showing linear sense gain
+  -> 1/x power setpoint, polarity (more wiper = lower power), danger at
+  low-wiper/high-power end. Added NN-GD376S p.7 annotated photo as VR701
+  physical-location reference. Superseded earlier CT701-based loop description.
