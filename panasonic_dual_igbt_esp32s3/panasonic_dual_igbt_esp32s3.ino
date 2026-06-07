@@ -10,7 +10,7 @@
  *  ======================================================================
  *  MAJOR REWRITE 2026-05-30 — incorporates VK3HZ canonical findings:
  *
- *  1) PIN 1 is the STATUS INPUT from the inverter, NOT a feedback
+ *  1) PIN 3 (orange) is the STATUS INPUT from the inverter, NOT a feedback
  *     pin we drive. The inverter emits a 110Hz/50% square wave on this line
  *     when the magnetron is warm and drawing current. We READ it, not write.
  *
@@ -30,7 +30,7 @@
  *
  *  HARDWARE CHANGE REQUIRED for safe status reading:
  *  --------------------------------------------------
- *  The board pulls CN701 pin 1 up to 5V via its internal pull-up. With only
+ *  The board pulls CN701 pin 3 up to 5V via its internal pull-up. With only
  *  a 1k series resistor (existing), GPIO5 would see ~5V on the high state,
  *  exceeding ESP32-S3's 3.3V max input.
  *
@@ -38,14 +38,14 @@
  *
  *       5V (board pull-up via ~1-2k internal)
  *         |
- *      pin1 -------- 1k ------- GPIO5 ----+
+ *      pin3 -------- 1k ------- GPIO5 ----+
  *                                         |
  *                                        2.2k
  *                                         |
  *                                        GND
  *
  *  GPIO5 voltage when board high:  ~3.0V  (safe)
- *  GPIO5 voltage when inverter sinks pin1 low: ~0V (safe)
+ *  GPIO5 voltage when inverter sinks pin3 low: ~0V (safe)
  *
  *  If you DO NOT add the 2.2k pulldown, the status read may be unreliable
  *  and could damage the GPIO over time. The firmware still runs — abort
@@ -54,14 +54,11 @@
  *
  *  ======================================================================
  *
- *  WIRING (pin numbers corrected 2026-06-06 — earlier comments had command and
- *  status pins swapped; the bench wiring is correct, only the labels were wrong.
- *  Confirmed pinout: pin1 = STATUS, pin2 = GND, pin3 = PWM command.
- *  Verify harness wire colors on the bench — prior color tags were unreliable):
- *    GPIO4 = PWM command out (push-pull TTL 3.3V) -> CN701 pin 3
+ *  WIRING (updated):
+ *    GPIO4 = PWM command out (push-pull TTL 3.3V) -> CN701 pin 1 (YELLOW)
  *    GPIO5 = STATUS INPUT from inverter (via 1k + 2.2k divider, see above)
- *              -> CN701 pin 1
- *    GND                                          -> CN701 pin 2
+ *              -> CN701 pin 3 (ORANGE)
+ *    GND                                          -> CN701 pin 2 (BROWN)
  *    GPIO7 = zero-cross in (monitor only)
  *    GPIO6 = capture tap (divider) for 'log' mode
  *    GPIO1 = Button1 ON/OFF ; GPIO2 = Button2 power step
@@ -103,12 +100,32 @@ uint32_t maxRunSec        = 60;           // HARD cap: web runs auto-off after t
 uint32_t runStartMs       = 0;            // when the current run began
 volatile uint32_t statusHzX10 = 0;        // measured status-line edge rate x10 (feedback)
 
-constexpr int PIN_PWM     = 4;   // command out -> CN701 pin3
-constexpr int PIN_STATUS  = 5;   // status IN  <- CN701 pin1, via divider
+constexpr int PIN_PWM     = 4;   // command out -> CN701 pin1 (YELLOW)
+constexpr int PIN_STATUS  = 5;   // status IN  <- CN701 pin3 (ORANGE), via divider
 constexpr int PIN_ZC      = 7;   // zero-cross monitor
 constexpr int PIN_BTN_ONOFF = 1;
 constexpr int PIN_BTN_POWER = 2;
 constexpr int PIN_LOG     = 6;   // capture tap
+constexpr int PIN_THERM   = 8;   // heatsink thermistor (NTC 100K B3950) ADC1_CH7
+constexpr int PIN_FAN_PWM = 9;   // cooling fan PWM out
+constexpr int PIN_FAN_TACH= 10;  // cooling fan tach in
+
+// ---- Thermal protection (heatsink NTC 100K, B=3950) ----
+// Divider: 3.3V -> NTC(100K) -> PIN_THERM node -> 100K fixed -> GND.
+// NTC on top: as heatsink heats, NTC R drops, node voltage RISES.
+constexpr float THERM_BETA   = 3950.0f;   // B3950
+constexpr float THERM_R0     = 100000.0f; // NTC nominal at 25C
+constexpr float THERM_T0     = 298.15f;   // 25C in Kelvin
+constexpr float THERM_RFIXED = 100000.0f; // bottom resistor
+float    heatsinkC   = 25.0f;             // last computed heatsink temp
+float    tempCutoffC = 75.0f;             // HARD cutoff (web-adjustable)
+float    tempWarnC   = 65.0f;             // warning threshold (web-adjustable)
+bool     thermalTrip = false;             // latched until manual restart
+
+// ---- Fan tach ----
+volatile uint32_t fanTachCount = 0;
+uint32_t fanRpm = 0;
+void IRAM_ATTR onFanTach(){ fanTachCount++; }
 
 constexpr bool INVERT_CMD = false;
 
@@ -335,6 +352,15 @@ void seqDrive(float duty){
 }
 
 bool startPlayback(){
+    // refuse to start if thermally tripped and still hot
+    if(thermalTrip){
+        if(heatsinkC > tempWarnC){
+            Serial.printf("[THERMAL] still %.1fC (>%.0f) — cool down before restart.\n", heatsinkC, tempWarnC);
+            return false;
+        }
+        thermalTrip = false;   // cooled enough, clear the latch
+        Serial.println("[THERMAL] trip cleared, heatsink cooled.");
+    }
     // Drive 222Hz at startup duty (pbWarmPct, default 33%). Feedback pin idles HIGH
     // (INPUT_PULLUP); inverter pulls it LOW when the tube draws current. Watch for
     // feedback LOW; if it doesn't come within the attempt window, restart and retry
@@ -352,10 +378,44 @@ bool startPlayback(){
 }
 
 // feedback LOW = inverter drawing current (3 consecutive lows = real, not a glitch)
+// read heatsink NTC -> deg C (beta equation). NTC top, 100k bottom, node rises with temp.
+float readHeatsinkC(){
+    int raw = analogRead(PIN_THERM);            // 0..4095 (12-bit)
+    if(raw<=0) raw=1; if(raw>=4095) raw=4094;
+    float v = raw/4095.0f;                       // fraction at node
+    float rntc = THERM_RFIXED * (1.0f - v) / v;  // Rntc = Rfixed*(1-v)/v
+    if(rntc<1) rntc=1;
+    float tK = 1.0f / ( (1.0f/THERM_T0) + (1.0f/THERM_BETA)*logf(rntc/THERM_R0) );
+    return tK - 273.15f;
+}
+
+// hard thermal cutoff — checked every loop, kills drive regardless of state
+void thermalCheck(){
+    heatsinkC = readHeatsinkC();
+    if(heatsinkC >= tempCutoffC && !thermalTrip){
+        thermalTrip = true;
+        cmdOff();
+        Serial.printf("[THERMAL] heatsink %.1fC >= cutoff %.1fC -> DRIVE OFF (manual restart)\n",
+                      heatsinkC, tempCutoffC);
+    }
+}
+
+// STRIKE = feedback line TOGGLING (sustained) vs steady-HIGH idle.
+// Not struck: pin held HIGH by pullup, ~0 edges. Struck: inverter pulls it
+// low repeatedly -> sustained edges (noisy ~110Hz+). We require sustained edge
+// activity over a window, NOT a momentary low (which noise/PWM-coupling fakes).
 bool feedbackLow(){
-    static uint8_t lc=0;
-    if(digitalRead(PIN_STATUS)==LOW){ if(++lc>=3){ lc=0; return true; } }
-    else lc=0;
+    static uint32_t lastEdges=0, winStart=0;
+    static uint8_t  goodWindows=0;
+    uint32_t now=millis();
+    if(winStart==0){ winStart=now; lastEdges=statusEdgeCount; return false; }
+    if(now-winStart >= 60){                         // 60ms sampling window
+        uint32_t e = statusEdgeCount - lastEdges;
+        lastEdges = statusEdgeCount; winStart = now;
+        // at ~110Hz toggling we'd see ~13 edges/60ms; noise dips give 0-2.
+        if(e >= 6) { if(++goodWindows>=4) { goodWindows=0; return true; } }  // 4 windows (~250ms) sustained
+        else goodWindows=0;
+    }
     return false;
 }
 
@@ -589,7 +649,7 @@ void handle(String c){
         Serial.println(F("on off | play | pwarm <ms> | pulse <ms> | p<10-75> | f<hz>"));
         Serial.println(F("tmo <ms> | force | nostatus"));
         Serial.println(F("statusinfo | log logdump | zc status"));
-        Serial.println(F("play = startup 33% -> RETRY until feedback pin LOW -> run 75%. [build: FBLOW-RETRY-v5]"));
+        Serial.println(F("play = startup 33% -> sustained-toggle strike -> run 75%. THERMAL CUTOFF 75C. [build: FBLOW-THERM-v6]"));
         Serial.println(F("Cap 75% on p<>; play bypasses cap (uses recorded ticks). 'pulse 500' bounded."));
     }
     else if(lc=="on"){ startRun(); }
@@ -687,6 +747,9 @@ small{color:#888}
  <div class=row><span class=k>Duty</span><span class=v id=duty>—</span></div>
  <div class=row><span class=k>Freq</span><span class=v id=freq>—</span></div>
  <div class=row><span class=k>Status 110Hz</span><span class=v id=shz>—</span></div>
+ <div class=row><span class=k>Heatsink</span><span class=v id=temp>—</span></div>
+ <div class=row><span class=k>Fan</span><span class=v id=rpm>—</span></div>
+ <div class=row><span class=k>Zero-cross</span><span class=v id=zc>—</span></div>
  <div class=row><span class=k>Run time</span><span class=v id=rt>—</span></div>
 </div>
 <button class=play onclick="go('/play')">PLAY  (warmup &rarr; run)</button>
@@ -716,6 +779,10 @@ function refresh(){fetch('/state').then(r=>r.json()).then(s=>{
  mode.textContent=s.mode.toUpperCase(); mode.style.color=s.run?'#5d5':'#888';
  duty.textContent=s.duty+' %'; freq.textContent=s.freq+' Hz';
  shz.textContent=s.shz+' Hz '+(s.spresent?'PRESENT':'absent');
+ temp.textContent=s.temp.toFixed(1)+' °C'+(s.trip?' TRIPPED':'');
+ temp.style.color = s.trip?'#f55':(s.temp>=s.twarn?'#fa3':'#5d5');
+ rpm.textContent=s.rpm+' rpm';
+ zc.textContent=s.zc.toFixed(1)+' Hz';
  rt.textContent=s.run?(s.rt+' s'):'—';
  if(document.activeElement.tagName!='INPUT'){
   i_freq.value=s.freq;i_warm.value=s.warm;i_run.value=s.runp;i_wms.value=s.wms;
@@ -743,14 +810,17 @@ void handleState(){
     lastWebContactMs = millis();                       // keep-alive
     uint32_t rt = running ? (millis()-runStartMs)/1000 : 0;
     bool spresent = (statusHzX10 >= 600 && statusHzX10 <= 1700);  // feedback toggling ~110Hz
-    char j[420];
+    char j[520];
+    float zchz = zcPeriodUs ? 1000000.0/zcPeriodUs : 0.0;
     snprintf(j,sizeof(j),
       "{\"run\":%d,\"mode\":\"%s\",\"duty\":%d,\"freq\":%.1f,"
       "\"warm\":%.1f,\"runp\":%.1f,\"wms\":%lu,\"shz\":%.1f,\"spresent\":%d,"
+      "\"temp\":%.1f,\"tcut\":%.1f,\"twarn\":%.1f,\"trip\":%d,\"rpm\":%lu,\"zc\":%.1f,"
       "\"rt\":%lu,\"dm\":%d,\"dms\":%lu,\"mr\":%lu}",
       running?1:0, modeStr(), curDuty, pbFreqHz,
       pbWarmPct, pbRunPct, (unsigned long)pbWarmupMs,
       statusHzX10/10.0, spresent?1:0,
+      heatsinkC, tempCutoffC, tempWarnC, thermalTrip?1:0, (unsigned long)fanRpm, zchz,
       (unsigned long)rt, deadmanOn?1:0,(unsigned long)deadmanSec,(unsigned long)maxRunSec);
     server.send(200,"application/json",j);
 }
@@ -759,6 +829,8 @@ void handleSet(){
     if(server.hasArg("freq"))   pbFreqHz   = server.arg("freq").toFloat();
     if(server.hasArg("warm"))   pbWarmPct  = server.arg("warm").toFloat();
     if(server.hasArg("run"))    pbRunPct   = server.arg("run").toFloat();
+    if(server.hasArg("tcut"))   tempCutoffC= server.arg("tcut").toFloat();
+    if(server.hasArg("twarn"))  tempWarnC  = server.arg("twarn").toFloat();
     if(server.hasArg("warmms")){ long m=server.arg("warmms").toInt(); if(m>=0&&m<=20000) pbWarmupMs=m; }
     if(server.hasArg("deadman")) deadmanOn = server.arg("deadman").toInt()!=0;
     if(server.hasArg("dmsec")){ long s=server.arg("dmsec").toInt(); if(s>=3&&s<=120) deadmanSec=s; }
@@ -794,6 +866,9 @@ void webTick(){
         uint32_t e=statusEdgeCount; uint32_t d=e-lastEdges; lastEdges=e;
         float hz = (d/ (float)(now-lastS) *1000.0f)/2.0f;   // edges/s /2 = Hz
         statusHzX10 = (uint32_t)lroundf(hz*10.0f);
+        // fan tach: most fans give 2 pulses/rev -> rpm = pulses/sec/2*60
+        uint32_t fc=fanTachCount; fanTachCount=0;
+        fanRpm = (uint32_t)lroundf( (fc/(float)(now-lastS)*1000.0f)/2.0f*60.0f );
         lastS=now;
     }
     // safety auto-off (web-initiated runs only; attended serial/button runs unaffected)
@@ -822,6 +897,15 @@ void setup(){
     cmdOff();
     pinMode(PIN_ZC, INPUT);
     attachInterrupt(PIN_ZC, onZeroCross, RISING);
+
+    // thermal + fan
+    analogReadResolution(12);
+    pinMode(PIN_THERM, INPUT);
+    pinMode(PIN_FAN_PWM, OUTPUT);
+    digitalWrite(PIN_FAN_PWM, HIGH);            // fan 100% on (constant for now)
+    pinMode(PIN_FAN_TACH, INPUT_PULLUP);
+    attachInterrupt(PIN_FAN_TACH, onFanTach, FALLING);
+    heatsinkC = readHeatsinkC();
     pinMode(PIN_BTN_ONOFF, INPUT_PULLUP);
     pinMode(PIN_BTN_POWER, INPUT_PULLUP);
     cmdFreqHz=FREQ_LIST[freqIdx]; curRunDuty=RUN_STEPS[runIdx]; setDuty(curRunDuty);
@@ -851,6 +935,7 @@ void loop(){
         else if(buf.length()<32) buf+=ch;
     }
     pollButtons();
+    thermalCheck();  // hard heatsink cutoff — runs every loop regardless of state
     seqTick();    // closed-loop startup state machine (startup->status->run, w/ retry)
     if(logArmed && logIdx>=LOG_MAXEDGES){ Serial.println("[log] buffer full."); logDump(); }
     if(logArmed && logIdx>0 && (micros()-logFirstUs) > LOG_WINDOW_MS*1000UL){
