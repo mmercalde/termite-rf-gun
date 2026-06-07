@@ -352,14 +352,14 @@ void seqDrive(float duty){
 }
 
 bool startPlayback(){
-    // refuse to start if thermally tripped and still hot
+    // clear any prior thermal trip if the heatsink is actually cool now
     if(thermalTrip){
-        if(heatsinkC > tempWarnC){
-            Serial.printf("[THERMAL] still %.1fC (>%.0f) — cool down before restart.\n", heatsinkC, tempWarnC);
+        if(heatsinkC >= tempCutoffC - 5.0f){    // still within 5C of cutoff = genuinely hot
+            Serial.printf("[THERMAL] still %.1fC — cool down before restart.\n", heatsinkC);
             return false;
         }
-        thermalTrip = false;   // cooled enough, clear the latch
-        Serial.println("[THERMAL] trip cleared, heatsink cooled.");
+        thermalTrip = false;                     // cool -> clear stale/glitch trip
+        Serial.printf("[THERMAL] trip cleared (heatsink %.1fC).\n", heatsinkC);
     }
     // Drive 222Hz at startup duty (pbWarmPct, default 33%). Feedback pin idles HIGH
     // (INPUT_PULLUP); inverter pulls it LOW when the tube draws current. Watch for
@@ -380,7 +380,10 @@ bool startPlayback(){
 // feedback LOW = inverter drawing current (3 consecutive lows = real, not a glitch)
 // read heatsink NTC -> deg C (beta equation). NTC top, 100k bottom, node rises with temp.
 float readHeatsinkC(){
-    int raw = analogRead(PIN_THERM);            // 0..4095 (12-bit)
+    // median-ish of several samples to reject switching-noise transients
+    uint32_t acc=0; const int N=8;
+    for(int i=0;i<N;i++){ acc += analogRead(PIN_THERM); }
+    int raw = acc/N;
     if(raw<=0) raw=1; if(raw>=4095) raw=4094;
     float v = raw/4095.0f;                       // fraction at node
     float rntc = THERM_RFIXED * (1.0f - v) / v;  // Rntc = Rfixed*(1-v)/v
@@ -389,15 +392,25 @@ float readHeatsinkC(){
     return tK - 273.15f;
 }
 
-// hard thermal cutoff — checked every loop, kills drive regardless of state
+// hard thermal cutoff — only while driving, after a settle delay, and only on
+// SUSTAINED over-temp. Averaged ADC + plausibility makes a switching-noise
+// transient unable to false-trip.
 void thermalCheck(){
     heatsinkC = readHeatsinkC();
-    if(heatsinkC >= tempCutoffC && !thermalTrip){
-        thermalTrip = true;
-        cmdOff();
-        Serial.printf("[THERMAL] heatsink %.1fC >= cutoff %.1fC -> DRIVE OFF (manual restart)\n",
-                      heatsinkC, tempCutoffC);
-    }
+    static uint8_t hotCount=0;
+    static uint32_t driveStartMs=0; static bool wasDriving=false;
+    if(!drvEnabled){ hotCount=0; wasDriving=false; return; }   // only guard while driving
+    if(!wasDriving){ wasDriving=true; driveStartMs=millis(); hotCount=0; }  // mark drive start
+    if(millis()-driveStartMs < 500) return;                   // 500ms settle after PLAY
+    if(heatsinkC >= tempCutoffC && heatsinkC < 300.0f){        // plausible + over limit
+        if(++hotCount >= 10){                                  // 10 sustained hot reads
+            if(!thermalTrip){
+                thermalTrip = true; cmdOff();
+                Serial.printf("[THERMAL] heatsink %.1fC >= cutoff %.1fC (sustained) -> DRIVE OFF\n",
+                              heatsinkC, tempCutoffC);
+            }
+        }
+    } else hotCount=0;
 }
 
 // STRIKE = feedback line TOGGLING (sustained) vs steady-HIGH idle.
@@ -649,11 +662,12 @@ void handle(String c){
         Serial.println(F("on off | play | pwarm <ms> | pulse <ms> | p<10-75> | f<hz>"));
         Serial.println(F("tmo <ms> | force | nostatus"));
         Serial.println(F("statusinfo | log logdump | zc status"));
-        Serial.println(F("play = startup 33% -> sustained-toggle strike -> run 75%. THERMAL CUTOFF 75C. [build: FBLOW-THERM-v7]"));
+        Serial.println(F("play=startup->run. THERMAL 75C (avg+settle+sustained). 'tclear'=clear. [build: FBLOW-THERM-v9]"));
         Serial.println(F("Cap 75% on p<>; play bypasses cap (uses recorded ticks). 'pulse 500' bounded."));
     }
     else if(lc=="on"){ startRun(); }
     else if(lc=="off"){ stopRun(); }
+    else if(lc=="tclear"){ thermalTrip=false; Serial.printf("[THERMAL] trip manually cleared (%.1fC)\n", heatsinkC); }
     else if(lc=="play"){ startPlayback(); }
     else if(lc.startsWith("pwarm")){
         int sp = c.indexOf(' ');
@@ -900,6 +914,7 @@ void setup(){
 
     // thermal + fan
     analogReadResolution(12);
+    analogSetPinAttenuation(PIN_THERM, ADC_11db);   // full ~3.3V range (node ~1.65V at 25C)
     pinMode(PIN_THERM, INPUT);
     pinMode(PIN_FAN_PWM, OUTPUT);
     digitalWrite(PIN_FAN_PWM, HIGH);            // fan 100% on (constant for now)
