@@ -383,14 +383,32 @@ board if we ever need definitive answers.
 
 ---
 
-## VR701 / VR1 — current-sense calibration trim (CORRECTS the CT701 model)
+## VR701 / VR1 — current-sense calibration trim (topology is generation-dependent)
 
-**Bottom line:** VR701 is the factory power-calibration trim. On Michael's
-board it adjusts the GAIN of a **shunt-derived** current-sense signal into the
-controller IC. It is NOT a filament adjust, and there is NO CT701 on these
-boards — earlier notes in this file describing a "CT701 current transformer ->
-constant-power loop" are WRONG for this variant and are superseded by this
-section.
+**Bottom line:** VR701 is the factory power-calibration trim — bench-confirmed
+on Michael's board (50k "503"). It scales a current-sense signal into the
+controller IC; it is NOT a filament adjust.
+
+**IMPORTANT CORRECTION (2026-06-12):** the sense *topology* is generation-
+dependent and the earlier "no CT701 / it's a SHUNT R703" claim in this section
+overstated what's actually documented. The record now:
+
+- **Both schematics IN THIS REPO show a CURRENT TRANSFORMER (CT701)**, not a
+  shunt, in the AC line between CN702 and the bridge rectifier DB701:
+  - `Panasonic_ServiceCD_Schematic.png` (authority #2) — labels it explicitly
+    "CT701 / CURRENT TRANSFORMER".
+  - `Panasonic_Inverter_Schematic_Annotated.pdf` (Russian RE, authority #4) —
+    also shows CT701 (secondary -> R715 4.5K/15W -> R716/R717 100R -> VR701/R719
+    divider -> controller power-control pins 7/8). Note Russian shows VR701=1k,
+    not 50k.
+- **Michael's ACTUAL board has NO current transformer** — confirmed by visual
+  inspection — and uses a **resistor-network sense instead.** This is consistent
+  with it being a LATER REVISION (same board already shows later-gen deltas:
+  0.18uF resonant cap, asymmetric 8.2nF/5.6nF doubler, 3.5K R702). Panasonic
+  migrated this sense path from CT to a resistor network on newer boards.
+- So: "CT701" is correct for the documented (older) generation; "resistor
+  network, no transformer" is correct for Michael's (later) board. Both are
+  true for their respective generations.
 
 ### What the part is
 - Board silkscreen **VR1** = schematic **VR701**. White trimmer marked **"503"
@@ -404,11 +422,17 @@ section.
   either schematic. The "do not adjust" warning has one documented exception:
   adjustment IS required after the HV transformer (T701) is replaced.
 
-### No CT701 — sense is a shunt
-The current sense on this board is **SHUNT R703** in the DC-bus return (read
-from the tomtechtod9200 RE schematic, confirmed by Michael: no current
-transformer present). This is why the board has no CT701. VR701 scales the
-shunt-derived sense before it reaches the controller.
+### Sense topology on Michael's board — resistor network (NOT schematic-backed in repo)
+Michael's board uses a **resistor-network current sense, no current transformer**
+(visual inspection). Earlier revisions of this doc called the element "SHUNT R703
+in the DC-bus return," citing the **tomtechtod9200 RE schematic** — but that
+schematic is **NOT in this repo**, and the **two schematics that ARE in the repo
+both show CT701** (see correction above). So the specific "R703, DC-bus return"
+designation and location is **board-observed + external-RE inferred, NOT verified
+against any in-repo schematic.** Treat the *resistor-network* fact as solid (seen
+on the board); treat the *exact element ID, value, and tap point* as UNCONFIRMED
+until the board trace below is done. VR701 scales whatever this network produces
+before it reaches the controller.
 
 ### Controller IC
 Named on the RE schematic as **AN47054A** (Panasonic analog ASIC, no public
@@ -421,7 +445,14 @@ passive front-end feeding it.
     VR701 50k:  potHi --(1-p)*50k-- wiper --(p)*50k-- GND
     wiper --[100k]-- controller sense pin (~pin 13)
 
-### SPICE result (`spice/vr701_cal.py`, `spice/results/03_vr701_cal.png`)
+### SPICE result (script NOT in repo — treat as hypothesis, not verified)
+NOTE (2026-06-12): `spice/vr701_cal.py` and `spice/results/03_vr701_cal.png`
+are CITED here but are **NOT present in the repo** (only `spice/ngspice_sweep.py`,
+a tank frequency sweep, exists). The conclusions below were never reproducible
+from committed files — treat them as a reasonable first-principles HYPOTHESIS to
+confirm on the bench, not a verified simulation. Also: the model assumed a
+specific sense front-end whose topology is now in question (see correction above),
+so even the qualitative result needs re-checking against the real board network.
 - Voltage at the controller sense pin is **linear** in wiper position ->
   VR701 is a linear gain control on the current-sense signal.
 - If the chip regulates that pin to a fixed reference, the regulated current
@@ -443,13 +474,36 @@ passive front-end feeding it.
    oven's spec'd input current (meaningless for this application).
 
 ### Open items for bench confirmation
-- R40 actual value, and VR701 wiring (divider vs rheostat; where the wiper
-  truly returns).
-- Whether AN47054A regulates this pin to a fixed reference, and its value.
+- **RESOLVING MEASUREMENT (do this first): trace VR701's wiper and both ends.**
+  This single trace settles the whole topology question that neither in-repo
+  schematic answers for this board:
+  - If the sense input originates at a **low-value resistor in the rectified-DC
+    return** -> shunt/resistor-network, bus-referenced (probing hazard; needs
+    isolation to read).
+  - If it originates at a **transformer/toroid in the AC line** (where CT701 sits
+    on the schematics) -> CT-coupled and isolated after all.
+  Result determines (a) shunt vs divider topology, (b) whether it's bus-
+  referenced (safety), (c) which VR701 calibration physics actually applies.
+- R40 actual value (if a resistor network), and VR701 wiring (divider vs
+  rheostat; where the wiper truly returns).
+- Whether the controller regulates this pin to a fixed reference, and its value.
 - One real datapoint: measured input current at a known VR701 position + DPC
-  duty, to pin the curve's absolute scale.
+  duty, to pin the curve's absolute scale (also serves as the IGBT-current
+  visibility the sweep firmware lacks).
 
-## Document history
+- 2026-06-12 CORRECTED the VR701/sense section after reading both in-repo
+  schematics directly. Both `Panasonic_ServiceCD_Schematic.png` (Panasonic,
+  authority #2) and `Panasonic_Inverter_Schematic_Annotated.pdf` (Russian RE,
+  #4) show **CT701 CURRENT TRANSFORMER** in the AC line — NOT a shunt. The
+  earlier "no CT701 / SHUNT R703 in DC-bus return" claim is board-observed +
+  external-RE (tomtechtod9200, not in repo) and is NOT backed by any in-repo
+  schematic. Re-framed as: CT701 = documented/older generation; resistor-network
+  (no transformer) = Michael's later board, confirmed only by visual inspection,
+  exact element ID/value/tap point UNCONFIRMED. Flagged `spice/vr701_cal.py` as
+  missing from repo (conclusions = hypothesis, not verified). Promoted "trace
+  VR701 wiper + both ends" to the top resolving measurement.
+
+## Earlier document history
 
 - 2026-05-30 Initial creation, gathered after IGBT failures on
   Frankenboard built from two damaged donor boards.
