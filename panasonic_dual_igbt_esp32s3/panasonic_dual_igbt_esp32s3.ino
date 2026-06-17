@@ -54,14 +54,16 @@
  *
  *  ======================================================================
  *
- *  WIRING (updated):
- *    GPIO4 = PWM command out (push-pull TTL 3.3V) -> CN701 pin 1 (YELLOW)
- *    GPIO5 = STATUS INPUT from inverter (via 1k + 2.2k divider, see above)
- *              -> CN701 pin 3 (ORANGE)
- *    GND                                          -> CN701 pin 2 (BROWN)
+ *  WIRING (Supermini HW-747 — top-row GPIO1-13 only; GPIO9=BOOT unused):
+ *    GPIO4 = PWM command out (push-pull TTL 3.3V) -> CN701 (YELLOW)
+ *    GPIO5 = STATUS INPUT from inverter (via 1k + 2.2k divider) -> CN701 (ORANGE)
+ *    GND                                                         -> CN701 (BROWN)
  *    GPIO7 = zero-cross in (monitor only)
- *    GPIO6 = capture tap (divider) for 'log' mode
- *    GPIO1 = Button1 ON/OFF ; GPIO2 = Button2 power step
+ *    RTD shared SPI bus (one harness -> both MAX31865 boards, Vin=3V3):
+ *      GPIO11=SCK  GPIO12=MOSI/SDI  GPIO13=MISO/SDO
+ *      GPIO1=CS magnetron board    GPIO6=CS heatsink board
+ *    Fans (4-wire):  mag PWM=GPIO2 tach=GPIO10   hs PWM=GPIO8(LED) tach=GPIO3
+ *    Buttons + on-board log-tap REMOVED (web-only control; ext. logic analyzer).
  *
  *  CONSOLE (115200):
  *    on / off          start (drive run duty, status-gated) / stop
@@ -72,8 +74,7 @@
  *    force             ignore status — open-loop run (proven single-IGBT path)
  *    nostatus          skip status detection, treat strike as complete
  *    statusinfo        print live status-signal edge rate
- *    log / logdump     capture mode on GPIO6
- *    zc / status / ?
+ *    caloff <C> | tclear | zc | status | ?
  * ==========================================================================*/
 
 #include "soc/gpio_struct.h"
@@ -82,6 +83,10 @@
 #include <math.h>
 #include <Preferences.h>     // v10: NVS persistence of tuned params
 #include <esp_system.h>      // v10: esp_reset_reason()
+#include <SPI.h>
+// v18: MAX31865 driven by bare manual-CS register access (see RTD bus block).
+// The Adafruit library is no longer used — its CS handling doesn't give the
+// chip the CS-low->first-clock gap the ESP32 needs; that caused all the garbage.
 
 // ---- WiFi AP (self-hosted, no router — for off-grid bench use) ----
 // Join SSID 'TermiteRF' (pass 'magnetron'), browse to http://192.168.4.1/
@@ -103,37 +108,157 @@ uint32_t runStartMs       = 0;            // when the current run began
 volatile uint32_t statusHzX10 = 0;        // measured status-line edge rate x10 (feedback)
 Preferences prefs;                        // v10: NVS store for tuned params ("termiterf")
 
-constexpr int PIN_PWM     = 4;   // command out -> CN701 pin1 (YELLOW)
-constexpr int PIN_STATUS  = 5;   // status IN  <- CN701 pin3 (ORANGE), via divider
+constexpr int PIN_PWM     = 4;   // command out -> CN701 (YELLOW)
+constexpr int PIN_STATUS  = 5;   // status IN  <- CN701 (ORANGE), via divider
 constexpr int PIN_ZC      = 7;   // zero-cross monitor
-constexpr int PIN_BTN_ONOFF = 1;
-constexpr int PIN_BTN_POWER = 2;
-constexpr int PIN_LOG     = 6;   // capture tap
-constexpr int PIN_THERM   = 8;   // heatsink thermistor (NTC 100K B3950) ADC1_CH7
-constexpr int PIN_FAN_PWM = 9;   // cooling fan PWM out
-constexpr int PIN_FAN_TACH= 10;  // cooling fan tach in
+// Buttons + on-board log-tap REMOVED on the Supermini (HW-747) to free GPIO1/2/6
+// for sensors/fans. Control is web-only; signal capture uses the external USB
+// logic analyzer (fx2lafw/PulseView). GPIO9 (=BOOT) is left UNCONNECTED.
 
-// ---- Thermal protection (heatsink NTC 100K, B3950) ----
-// Divider: 3.3V -> NTC(100K) -> PIN_THERM node -> Rfixed -> GND.
-// NTC on top: as heatsink heats, NTC R drops, node voltage RISES.
-// v10: CALIBRATED to this probe via two-point bench fit (27.22C & 65.56C).
-//   Read with analogReadMilliVolts() (eFuse-calibrated) — raw analogRead was
-//   nonlinear and read HOT in the upper range. Rntc = Rfixed*(Vsup-Vnode)/Vnode.
-constexpr float THERM_BETA   = 3868.0f;   // fitted (was nominal 3950)
-constexpr float THERM_R0     = 100972.0f; // fitted NTC @25C (was 100000)
-constexpr float THERM_T0     = 298.15f;   // 25C in Kelvin
-constexpr float THERM_RFIXED = 99000.0f;  // MEASURED bottom resistor (2x200k || = 99.0k)
-constexpr float THERM_VSUP_MV= 3311.0f;   // MEASURED 3V3 rail (divider top)
-float    thermCalOffset = 0.0f;           // optional live trim (deg C), 'caloff <C>', NVS-saved
-float    heatsinkC   = 25.0f;             // last computed heatsink temp
-float    tempCutoffC = 75.0f;             // HARD cutoff (web-adjustable; PLACEHOLDER until measured)
-float    tempWarnC   = 65.0f;             // warning threshold (web-adjustable)
+// ---- Cooling fans (2x AFC0612D 60mm 4-WIRE PWM) ----
+// 4-wire: 12V power CONSTANT; SPEED is a ~25kHz PWM on the control wire (blue),
+// tach (yellow) reads back. Each fan slaved to its own RTD zone.
+// Supermini map (top-row GPIO1-13 only; rest are bottom-pad / unreachable):
+//   GPIO8 = on-board LED -> hs-fan PWM 25kHz reads as a steady dim power light.
+//   GPIO3 = strapping; used as a tach INPUT (idles HIGH) so it's boot-safe.
+constexpr int PIN_FAN_PWM_MAG  = 2;   // mag fan PWM out (control wire / blue)
+constexpr int PIN_FAN_TACH_MAG = 10;  // mag fan tach in (yellow)  [was 1; matches wired fan]
+constexpr int PIN_FAN_PWM_HS   = 8;   // hs  fan PWM out (on-board LED pin -> dim)
+constexpr int PIN_FAN_TACH_HS  = 3;   // hs  fan tach in (strapping; input idles HIGH)
+constexpr int FAN_PWM_HZ   = 25000;   // Intel 4-wire spec ~25kHz (inaudible)
+constexpr int FAN_PWM_BITS = 8;       // 0..255
+constexpr int FAN_CH_MAG   = 4;       // LEDC channel (Arduino core 2.x; ignored on 3.x)
+constexpr int FAN_CH_HS    = 5;
+
+// ---- MAX31865 RTD bus (SOFTWARE SPI — explicit pins, bus-remap-proof on S3) ----
+// Two GY-MAX31865 boards (PT100, RREF=430R) share ONE data bus: SCK/MOSI/MISO +
+// 3V3 + GND run as a single harness to a junction, then split to both boards.
+// Only the two CS lines are per-board (they CANNOT be tied — bus contention).
+// Feed Vin = 3V3 (NOT 5V) so SDO stays at 3.3V into the ESP32.
+constexpr int PIN_RTD_SCK    = 11;  // CLK   -> both boards
+constexpr int PIN_RTD_MOSI   = 12;  // SDI   -> both boards (data INTO  MAX31865)
+constexpr int PIN_RTD_MISO   = 13;  // SDO   <- both boards (data OUT of MAX31865)
+constexpr int PIN_RTD_CS_MAG = 1;   // CS: magnetron-fin board  [was 10; freed for fan tach]
+constexpr int PIN_RTD_CS_HS  = 6;   // CS: IGBT-heatsink board (freed log-tap pin)
+constexpr int RTD_CS_GAP_US  = 10;  // v18: CS-low -> first-clock gap. THE FIX.
+
+// ---- Thermal protection (two PT100 RTDs via MAX31865) ----
+// magnetron fins + IGBT heatsink. PT100 board: RREF=430R, RNOMINAL=100.
+// thermalCheck() trips on the HOTTER of the two (worst-case device wins).
+// v18 ROOT CAUSE: the MAX31865 auto-detects SPI clock polarity when CS first
+// drops and needs a GAP before the first clock edge. The ESP32 SPI driver (and
+// the Adafruit lib's HW-CS) drop CS+clock together -> chip never locks mode ->
+// 0xFF / rail-flipping garbage. Fix: drive CS as a plain GPIO with an explicit
+// delayMicroseconds() gap. Bench-proven: comms round-trip OK, steady 109.7R.
+// 2-WIRE board setup (no trace cuts): solder "2/3 Wire" + "2 Wire" pads closed,
+// leave "2 4 3" selector on the "2 4" side. Two reds -> RTD+, insulated -> RTD-.
+constexpr float RTD_RREF     = 430.0f;    // PT100 reference resistor (marked "4300")
+constexpr float RTD_RNOMINAL = 100.0f;    // PT100 nominal @0C
+
+SPIClass    SPIRTD(FSPI);                          // dedicated HW SPI bus, manual CS
+SPISettings RTD_SPI(1000000, MSBFIRST, SPI_MODE1); // MAX31865 = SPI mode 1, 1 MHz
+
+// Wire mode is runtime-switchable + NVS-persisted. 2 & 4 share the same chip
+// config bit (D4=0); only 3-wire sets D4=1. Default 2-wire (bench-confirmed).
+int rtdWireN = 2;
+static inline uint8_t rtdWireBit(){ return (rtdWireN==3) ? 0x10 : 0x00; }
+
+// --- bare-register access, MANUAL CS with polarity-lock gap (per-board CS) ---
+static uint8_t rtdRd8(int cs, uint8_t addr){
+    SPIRTD.beginTransaction(RTD_SPI);
+    digitalWrite(cs, LOW); delayMicroseconds(RTD_CS_GAP_US);
+    SPIRTD.transfer(addr & 0x7F);
+    uint8_t v = SPIRTD.transfer(0xFF);
+    digitalWrite(cs, HIGH); SPIRTD.endTransaction();
+    return v;
+}
+static uint16_t rtdRd16(int cs, uint8_t addr){
+    SPIRTD.beginTransaction(RTD_SPI);
+    digitalWrite(cs, LOW); delayMicroseconds(RTD_CS_GAP_US);
+    SPIRTD.transfer(addr & 0x7F);
+    uint8_t hi = SPIRTD.transfer(0xFF);
+    uint8_t lo = SPIRTD.transfer(0xFF);
+    digitalWrite(cs, HIGH); SPIRTD.endTransaction();
+    return ((uint16_t)hi << 8) | lo;
+}
+static void rtdWr8(int cs, uint8_t addr, uint8_t val){
+    SPIRTD.beginTransaction(RTD_SPI);
+    digitalWrite(cs, LOW); delayMicroseconds(RTD_CS_GAP_US);
+    SPIRTD.transfer(addr | 0x80);
+    SPIRTD.transfer(val);
+    digitalWrite(cs, HIGH); SPIRTD.endTransaction();
+}
+// one-shot conversion -> raw 15-bit RTD code; sets faultByte from fault reg
+static uint16_t rtdReadRaw(int cs, uint8_t &faultByte){
+    uint8_t base = 0x80 | rtdWireBit();    // VBIAS on + wire mode
+    rtdWr8(cs, 0x00, base);
+    delay(10);                             // bias settle
+    rtdWr8(cs, 0x00, base | 0x20);         // 1-shot convert
+    delay(65);                             // conversion time
+    uint16_t rtd = rtdRd16(cs, 0x01);
+    faultByte = rtdRd8(cs, 0x07);
+    if(faultByte) rtdWr8(cs, 0x00, base | 0x02);   // clear fault
+    return rtd >> 1;                       // drop the fault bit
+}
+// Callendar-Van Dusen, PT100 (matches Adafruit temperature() for T>=0)
+static float rtdResToTemp(float Rt){
+    const float A = 3.9083e-3f, B = -5.775e-7f;
+    float Z1 = -A, Z2 = A*A - 4*B, Z3 = (4*B)/RTD_RNOMINAL, Z4 = 2*B;
+    float t = (sqrtf(Z2 + Z3*Rt) + Z1) / Z4;
+    if(t >= 0) return t;
+    float r = (Rt/RTD_RNOMINAL)*100.0f, rr = r;
+    t = -242.02f + 2.2228f*rr;  rr*=r;
+    t += 2.5859e-3f*rr;         rr*=r;
+    t -= 4.8260e-6f*rr;         rr*=r;
+    t -= 2.8183e-8f*rr;         rr*=r;
+    t += 1.5243e-10f*rr;
+    return t;
+}
+static void rtdApplyWires(){ /* v18: wire mode applied per-read via config byte */ }
+// Read both boards in 2/3/4-wire and print raw+fault — the mode reading
+// raw~8400 / flt 0x00 matches your soldered jumpers.
+static void rtdSweep(){
+    Serial.println("[RTD-SWEEP] manual-CS, both boards (want raw~8400 / flt 0x00):");
+    int save = rtdWireN;
+    for(int n=2; n<=4; n++){
+        rtdWireN = n;
+        uint8_t fM, fH;
+        uint16_t rM = rtdReadRaw(PIN_RTD_CS_MAG, fM);
+        uint16_t rH = rtdReadRaw(PIN_RTD_CS_HS , fH);
+        Serial.printf("   %d-wire: mag raw=%u flt=0x%02X  |  hs raw=%u flt=0x%02X\n", n, rM, fM, rH, fH);
+    }
+    rtdWireN = save;
+    Serial.printf("   active mode = %d-wire. Lock another live with 'wire <2|3|4>'.\n", rtdWireN);
+}
+float    thermCalOffset = 0.0f;           // optional live trim (deg C), applied to BOTH, NVS-saved
+float    magC        = 25.0f;             // magnetron-fin temp
+float    heatsinkC   = 25.0f;             // IGBT-heatsink temp (name kept -> web/JSON untouched)
+uint8_t  rtdFault    = 0;                  // fault bitmask: low nibble=mag, high nibble=hs (0=ok)
+// Per-sensor thresholds — magnetron fins and IGBT heatsink have very different
+// limits, so they get INDEPENDENT cutoffs. All web-adjustable + NVS-persisted.
+//   Magnetron: flange thermal fuse ~150C; fins run 100-150C under load -> a
+//     single 75C cutoff would nuisance-trip during NORMAL operation.
+//   IGBT (IHW40N120R5): Tj max 175C. The heatsink sits BELOW Tj by the loaded
+//     junction-to-sink gradient (50-75C under load), so heatsink cutoff is kept
+//     conservative at 80C per the Panasonic bench finding — keeps Tj clear of
+//     the limit. Fan forced to 100% by 70C, well before the 80C trip.
+float    tempCutoffMag = 125.0f;          // mag-fin HARD cutoff (below ~150C fuse)
+float    tempWarnMag   = 110.0f;          // mag-fin warning -> fan forced 100%
+float    tempCutoffHs  = 80.0f;           // IGBT-heatsink HARD cutoff (bench-safe)
+float    tempWarnHs    = 70.0f;           // IGBT-heatsink warning -> fan forced 100%
+// Fan ramp: floor duty below rampStart, linear up to 100% at the WARN temp.
+constexpr float FAN_MIN_PCT  = 40.0f;     // floor while powered (airflow always on)
+constexpr float FAN_RAMP_MAG = 70.0f;     // mag fan starts ramping above this (C)
+constexpr float FAN_RAMP_HS  = 50.0f;     // hs  fan starts ramping above this (C)
+uint8_t  fanDutyMag = 100, fanDutyHs = 100;  // last applied duty % (telemetry)
 bool     thermalTrip = false;             // latched until manual restart
 
 // ---- Fan tach ----
-volatile uint32_t fanTachCount = 0;
-uint32_t fanRpm = 0;
-void IRAM_ATTR onFanTach(){ fanTachCount++; }
+// ---- Fan tach (one per fan, 2 pulses/rev typical) ----
+volatile uint32_t fanTachMag = 0, fanTachHs = 0;
+uint32_t fanRpmMag = 0, fanRpmHs = 0;
+void IRAM_ATTR onTachMag(){ fanTachMag++; }
+void IRAM_ATTR onTachHs (){ fanTachHs++; }
 
 constexpr bool INVERT_CMD = false;
 
@@ -368,12 +493,15 @@ void seqDrive(float duty){
 bool startPlayback(){
     // clear any prior thermal trip if the heatsink is actually cool now
     if(thermalTrip){
-        if(heatsinkC >= tempCutoffC - 5.0f){    // still within 5C of cutoff = genuinely hot
-            Serial.printf("[THERMAL] still %.1fC — cool down before restart.\n", heatsinkC);
+        bool magHot = magC      >= tempCutoffMag - 5.0f;   // within 5C of cutoff = still hot
+        bool hsHot  = heatsinkC >= tempCutoffHs  - 5.0f;
+        if(magHot || hsHot){
+            Serial.printf("[THERMAL] still hot (mag %.1f/%.1f  hs %.1f/%.1f) — cool down.\n",
+                          magC, tempCutoffMag, heatsinkC, tempCutoffHs);
             return false;
         }
         thermalTrip = false;                     // cool -> clear stale/glitch trip
-        Serial.printf("[THERMAL] trip cleared (heatsink %.1fC).\n", heatsinkC);
+        Serial.printf("[THERMAL] trip cleared (mag %.1f / hs %.1f).\n", magC, heatsinkC);
     }
     // Drive 222Hz at startup duty (pbWarmPct, default 33%). Feedback pin idles HIGH
     // (INPUT_PULLUP); inverter pulls it LOW when the tube draws current. Watch for
@@ -392,37 +520,85 @@ bool startPlayback(){
 }
 
 // feedback LOW = inverter drawing current (3 consecutive lows = real, not a glitch)
-// read heatsink NTC -> deg C. v10: eFuse-CALIBRATED ADC (analogReadMilliVolts),
-// Rntc from measured Vsup/Rfixed, fitted BETA/R0, plus optional live offset.
-float readHeatsinkC(){
-    // average calibrated millivolts at the node (rejects residual jitter)
-    uint32_t accMv=0; const int N=16;
-    for(int i=0;i<N;i++){ accMv += analogReadMilliVolts(PIN_THERM); }
-    float vnode = accMv/(float)N;                 // mV at the divider node
-    if(vnode < 1.0f) vnode = 1.0f;
-    if(vnode > THERM_VSUP_MV-1.0f) vnode = THERM_VSUP_MV-1.0f;
-    float rntc = THERM_RFIXED * (THERM_VSUP_MV - vnode) / vnode;  // ohms
-    if(rntc < 1.0f) rntc = 1.0f;
-    float tK = 1.0f / ( (1.0f/THERM_T0) + (1.0f/THERM_BETA)*logf(rntc/THERM_R0) );
-    return (tK - 273.15f) + thermCalOffset;
+// read both PT100s via MAX31865 (software SPI). Updates magC/heatsinkC/rtdFault.
+// Returns the HOTTER of the two — the value the hard cutoff acts on. A faulted
+// sensor is reported but forced low so it cannot drive a false trip.
+static float readOneRTD(int cs, uint8_t &faultOut){
+    uint8_t f; uint16_t raw = rtdReadRaw(cs, f);
+    faultOut = f;
+    float R = (RTD_RREF * raw) / 32768.0f;
+    return rtdResToTemp(R) + thermCalOffset;
+}
+float readRTDs(){
+    uint8_t fM=0, fH=0;
+    magC      = readOneRTD(PIN_RTD_CS_MAG, fM);
+    heatsinkC = readOneRTD(PIN_RTD_CS_HS , fH);
+    rtdFault  = (fM?0x0F:0) | (fH?0xF0:0);
+    float hm = fM ? -100.0f : magC;       // faulted sensor can't win the max
+    float hh = fH ? -100.0f : heatsinkC;
+    return (hm > hh) ? hm : hh;
 }
 
-// hard thermal cutoff — only while driving, after a settle delay, and only on
-// SUSTAINED over-temp. Averaged ADC + plausibility makes a switching-noise
-// transient unable to false-trip.
+// ---- Fan PWM (4-wire, 25kHz LEDC). pct 0..100 -> control wire duty. ----
+static inline void fanWrite(int pin, int ch, uint8_t pct){
+    uint32_t d = (uint32_t)pct * ((1u<<FAN_PWM_BITS)-1) / 100u;   // 0..255
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    (void)ch; ledcWrite(pin, d);
+#else
+    (void)pin; ledcWrite(ch, d);
+#endif
+}
+static void fanInit(){
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    ledcAttach(PIN_FAN_PWM_MAG, FAN_PWM_HZ, FAN_PWM_BITS);
+    ledcAttach(PIN_FAN_PWM_HS , FAN_PWM_HZ, FAN_PWM_BITS);
+#else
+    ledcSetup(FAN_CH_MAG, FAN_PWM_HZ, FAN_PWM_BITS); ledcAttachPin(PIN_FAN_PWM_MAG, FAN_CH_MAG);
+    ledcSetup(FAN_CH_HS , FAN_PWM_HZ, FAN_PWM_BITS); ledcAttachPin(PIN_FAN_PWM_HS , FAN_CH_HS);
+#endif
+    fanWrite(PIN_FAN_PWM_MAG, FAN_CH_MAG, 100);   // full until first temp read
+    fanWrite(PIN_FAN_PWM_HS , FAN_CH_HS , 100);
+}
+// floor below rampStart, linear to 100% at warn temp, clamped.
+static uint8_t fanCurve(float t, float rampStart, float warn){
+    if(t >= warn) return 100;
+    if(t <= rampStart) return (uint8_t)FAN_MIN_PCT;
+    float p = FAN_MIN_PCT + (100.0f-FAN_MIN_PCT)*(t-rampStart)/(warn-rampStart);
+    if(p < FAN_MIN_PCT) p = FAN_MIN_PCT; if(p > 100.0f) p = 100.0f;
+    return (uint8_t)lroundf(p);
+}
+void fanControl(){
+    // faulted sensor -> force that fan to 100% (fail-safe to max cooling)
+    fanDutyMag = (rtdFault & 0x0F) ? 100 : fanCurve(magC,      FAN_RAMP_MAG, tempWarnMag);
+    fanDutyHs  = (rtdFault & 0xF0) ? 100 : fanCurve(heatsinkC, FAN_RAMP_HS,  tempWarnHs);
+    fanWrite(PIN_FAN_PWM_MAG, FAN_CH_MAG, fanDutyMag);
+    fanWrite(PIN_FAN_PWM_HS , FAN_CH_HS , fanDutyHs);
+}
+
+// hard thermal cutoff — PER SENSOR. Throttled to ~10Hz (SPI cadence); fans
+// updated every read regardless of drive state (idle/cooldown airflow). Trip
+// requires 10 sustained over-limit reads (~1s) after a 500ms post-PLAY settle.
 void thermalCheck(){
-    heatsinkC = readHeatsinkC();
+    static uint32_t lastRead=0;
+    uint32_t now=millis();
+    if(now-lastRead < 100) return;            // ~10Hz read throttle
+    lastRead = now;
+    readRTDs();                               // updates magC + heatsinkC + rtdFault
+    fanControl();                             // proportional fan duty per zone
+
     static uint8_t hotCount=0;
     static uint32_t driveStartMs=0; static bool wasDriving=false;
-    if(!drvEnabled){ hotCount=0; wasDriving=false; return; }   // only guard while driving
-    if(!wasDriving){ wasDriving=true; driveStartMs=millis(); hotCount=0; }  // mark drive start
-    if(millis()-driveStartMs < 500) return;                   // 500ms settle after PLAY
-    if(heatsinkC >= tempCutoffC && heatsinkC < 300.0f){        // plausible + over limit
-        if(++hotCount >= 10){                                  // 10 sustained hot reads
+    if(!drvEnabled){ hotCount=0; wasDriving=false; return; }   // only trip while driving
+    if(!wasDriving){ wasDriving=true; driveStartMs=now; hotCount=0; }
+    if(now-driveStartMs < 500) return;        // settle after PLAY
+    bool magOver = (magC      >= tempCutoffMag && magC      < 400.0f);
+    bool hsOver  = (heatsinkC >= tempCutoffHs  && heatsinkC < 400.0f);
+    if(magOver || hsOver){
+        if(++hotCount >= 10){
             if(!thermalTrip){
                 thermalTrip = true; cmdOff();
-                Serial.printf("[THERMAL] heatsink %.1fC >= cutoff %.1fC (sustained) -> DRIVE OFF\n",
-                              heatsinkC, tempCutoffC);
+                Serial.printf("[THERMAL] mag %.1f/%.1fC  hs %.1f/%.1fC (sustained) -> DRIVE OFF\n",
+                              magC, tempCutoffMag, heatsinkC, tempCutoffHs);
             }
         }
     } else hotCount=0;
@@ -627,74 +803,14 @@ void pulseRun(uint32_t ms){
 }
 
 // ============================================================================
-//  COMMAND-LINE LOGGER (capture mode for GPIO6)
+//  Signal capture is now done with the external USB logic analyzer
+//  (fx2lafw / PulseView). The on-board GPIO6 log-tap was removed so GPIO6
+//  could become the 2nd MAX31865 chip-select on the pin-limited Supermini.
 // ============================================================================
-#define LOG_MAXEDGES 8000
-#define BOOT_AUTOLOG 0
-constexpr uint32_t LOG_WINDOW_MS = 10000;
-
-volatile uint32_t logT[LOG_MAXEDGES];
-volatile uint8_t  logL[LOG_MAXEDGES];
-volatile uint32_t logIdx = 0;
-volatile bool     logArmed = false;
-volatile uint32_t logFirstUs = 0;
-
-void IRAM_ATTR onLogEdge(){
-    if(!logArmed || logIdx>=LOG_MAXEDGES) return;
-    uint32_t t=micros();
-    if(logIdx==0) logFirstUs=t;
-    logT[logIdx]=t;
-    logL[logIdx]=(uint8_t)digitalRead(PIN_LOG);
-    logIdx++;
-}
-
-void logDump(){
-    logArmed=false;
-    detachInterrupt(PIN_LOG);
-    if(!logIdx){ Serial.println("[log] no edges captured."); return; }
-    uint32_t base=logT[0];
-    Serial.println("---RAW BEGIN---");
-    Serial.flush();
-    Serial.println("idx,t_us,level,dt_us");
-    for(uint32_t i=0;i<logIdx;i++){
-        Serial.printf("%lu,%lu,%u,%lu\n",(unsigned long)i,
-            (unsigned long)(logT[i]-base),logL[i],
-            (unsigned long)(i?logT[i]-logT[i-1]:0));
-        if((i & 0x1F)==0){ Serial.flush(); delay(2); }
-    }
-    Serial.flush();
-    Serial.printf("---RAW END--- %lu edges\n",(unsigned long)logIdx);
-    Serial.println("===CAPTURE DONE===");
-    Serial.flush();
-}
-
-void logArm(){
-    if(running) stopRun();
-    logIdx=0; logFirstUs=0; logArmed=true;
-    pinMode(PIN_LOG, INPUT);
-    attachInterrupt(PIN_LOG, onLogEdge, CHANGE);
-    Serial.println("[log] ARMED on GPIO6.");
-}
 
 // ---- buttons ----
-unsigned long lastB1=0, lastB2=0;
-constexpr unsigned long DEBOUNCE_MS=200;
-int prevB1=HIGH, prevB2=HIGH;
-
-void btnOnOff(){ if(running) stopRun(); else startPlayback(); }
-void btnPower(){
-    runIdx=(runIdx+1)%RUN_COUNT;
-    curRunDuty=RUN_STEPS[runIdx];
-    if(running){ setDuty(curRunDuty); }
-    Serial.printf("[BTN2] run power -> %d%%%s\n", curRunDuty, running?" (live)":" (set; BTN1 to run)");
-}
-void pollButtons(){
-    int b1=digitalRead(PIN_BTN_ONOFF), b2=digitalRead(PIN_BTN_POWER);
-    unsigned long now=millis();
-    if(prevB1==HIGH && b1==LOW && now-lastB1>DEBOUNCE_MS){ lastB1=now; btnOnOff(); }
-    if(prevB2==HIGH && b2==LOW && now-lastB2>DEBOUNCE_MS){ lastB2=now; btnPower(); }
-    prevB1=b1; prevB2=b2;
-}
+// Physical buttons removed on the Supermini (pins reused for fans). Start/stop
+// and power are web-only (PLAY/STOP + Run duty on the page) and serial (on/off/p).
 
 // ---- handle command ----
 // ---- v10: NVS persistence of tuned params (survives RF-induced resets) ----
@@ -705,8 +821,11 @@ void savePrefs(){
     prefs.putULong("warmms", pbWarmupMs);
     prefs.putFloat("warmpct", pbWarmPct);
     prefs.putFloat("runpct",  pbRunPct);
-    prefs.putFloat("tcut",    tempCutoffC);
-    prefs.putFloat("twarn",   tempWarnC);
+    prefs.putFloat("tcutM",   tempCutoffMag);
+    prefs.putFloat("twarnM",  tempWarnMag);
+    prefs.putFloat("tcutH",   tempCutoffHs);
+    prefs.putFloat("twarnH",  tempWarnHs);
+    prefs.putInt  ("rtdwn",   rtdWireN);
     prefs.putFloat("caloff",  thermCalOffset);
     prefs.putULong("freq",    cmdFreqHz);
     prefs.putULong("maxrun",  maxRunSec);
@@ -719,8 +838,11 @@ void loadPrefs(){
     pbWarmupMs    = prefs.getULong("warmms", pbWarmupMs);
     pbWarmPct     = prefs.getFloat("warmpct", pbWarmPct);
     pbRunPct      = prefs.getFloat("runpct",  pbRunPct);
-    tempCutoffC   = prefs.getFloat("tcut",    tempCutoffC);
-    tempWarnC     = prefs.getFloat("twarn",   tempWarnC);
+    tempCutoffMag = prefs.getFloat("tcutM",   tempCutoffMag);
+    tempWarnMag   = prefs.getFloat("twarnM",  tempWarnMag);
+    tempCutoffHs  = prefs.getFloat("tcutH",   tempCutoffHs);
+    tempWarnHs    = prefs.getFloat("twarnH",  tempWarnHs);
+    rtdWireN      = prefs.getInt  ("rtdwn",   rtdWireN);
     thermCalOffset= prefs.getFloat("caloff",  thermCalOffset);
     cmdFreqHz     = prefs.getULong("freq",    cmdFreqHz);
     maxRunSec     = prefs.getULong("maxrun",  maxRunSec);
@@ -760,13 +882,23 @@ void handle(String c){
     if(lc=="?"||lc=="help"){
         Serial.println(F("on off | play | pwarm <ms> | pulse <ms> | p<10-75> | f<hz>"));
         Serial.println(F("tmo <ms> | force | nostatus | caloff <C>"));
-        Serial.println(F("statusinfo | log logdump | zc status"));
-        Serial.println(F("play=startup->run. RUN strike-loss auto-off (non-latch). Temp CALIBRATED. [build: FBLOW-THERM-v10]"));
+        Serial.println(F("statusinfo | zc | status"));
+        Serial.println(F("play=startup->run. RUN strike-loss auto-off (non-latch). RTD: PT100 x2. [build: FBLOW-RTD-FAN-v18]"));
         Serial.println(F("Cap 75% on p<>; play bypasses cap (uses recorded ticks). 'pulse 500' bounded. Params persist (NVS)."));
     }
     else if(lc=="on"){ startRun(); }
     else if(lc=="off"){ stopRun(); }
     else if(lc=="tclear"){ thermalTrip=false; Serial.printf("[THERMAL] trip manually cleared (%.1fC)\n", heatsinkC); }
+    else if(lc.startsWith("wire")){
+        int n = c.substring(4).toInt();
+        if(n==2||n==3||n==4){
+            rtdWireN=n; savePrefs();
+            uint8_t fM, fH;
+            uint16_t rM = rtdReadRaw(PIN_RTD_CS_MAG, fM);
+            uint16_t rH = rtdReadRaw(PIN_RTD_CS_HS , fH);
+            Serial.printf("[wire] %d-wire -> mag raw=%u flt=0x%02X | hs raw=%u flt=0x%02X (saved)\n", n,rM,fM,rH,fH);
+        } else Serial.println("usage: wire <2|3|4>");
+    }
     else if(lc=="play"){ startPlayback(); }
     else if(lc.startsWith("pwarm")){
         int sp = c.indexOf(' ');
@@ -781,9 +913,9 @@ void handle(String c){
         int sp = c.indexOf(' ');
         if(sp>0){
             float o = c.substring(sp+1).toFloat();
-            if(o>=-30.0f && o<=30.0f){ thermCalOffset=o; savePrefs();
-                Serial.printf("[caloff] temp offset = %+.2fC (heatsink now %.1fC)\n",
-                              thermCalOffset, readHeatsinkC()); }
+            if(o>=-30.0f && o<=30.0f){ thermCalOffset=o; savePrefs(); readRTDs();
+                Serial.printf("[caloff] temp offset = %+.2fC (mag %.1fC / hs %.1fC)\n",
+                              thermCalOffset, magC, heatsinkC); }
             else Serial.println("[caloff] usage: caloff <-30..30>");
         } else Serial.printf("[caloff] current=%+.2fC\n", thermCalOffset);
     }
@@ -817,8 +949,6 @@ void handle(String c){
             (unsigned long)STATUS_EDGES_MIN);
         Serial.printf("[statusinfo] PIN_STATUS instantaneous: %d\n", digitalRead(PIN_STATUS));
     }
-    else if(lc=="log"){ logArm(); }
-    else if(lc=="logdump"){ logDump(); }
     else if(lc=="status"){
         Serial.printf("[status] run=%d duty=%d%% freq=%luHz tmo=%lums force=%d nostatus=%d\n",
             running, curDuty, (unsigned long)cmdFreqHz,
@@ -870,8 +1000,10 @@ small{color:#888}
  <div class=row><span class=k>Duty</span><span class=v id=duty>—</span></div>
  <div class=row><span class=k>Freq</span><span class=v id=freq>—</span></div>
  <div class=row><span class=k>Status 110Hz</span><span class=v id=shz>—</span></div>
+ <div class=row><span class=k>Magnetron</span><span class=v id=mtemp>—</span></div>
  <div class=row><span class=k>Heatsink</span><span class=v id=temp>—</span></div>
- <div class=row><span class=k>Fan</span><span class=v id=rpm>—</span></div>
+ <div class=row><span class=k>Fan mag</span><span class=v id=fanm>—</span></div>
+ <div class=row><span class=k>Fan hs</span><span class=v id=fanh>—</span></div>
  <div class=row><span class=k>Zero-cross</span><span class=v id=zc>—</span></div>
  <div class=row><span class=k>Run time</span><span class=v id=rt>—</span></div>
 </div>
@@ -902,9 +1034,12 @@ function refresh(){fetch('/state').then(r=>r.json()).then(s=>{
  mode.textContent=s.mode.toUpperCase(); mode.style.color=s.run?'#5d5':'#888';
  duty.textContent=s.duty+' %'; freq.textContent=s.freq+' Hz';
  shz.textContent=s.shz+' Hz '+(s.spresent?'PRESENT':'absent');
- temp.textContent=s.temp.toFixed(1)+' °C / '+(s.temp*9/5+32).toFixed(1)+' °F'+(s.trip?' TRIPPED':'');
- temp.style.color = s.trip?'#f55':(s.temp>=s.twarn?'#fa3':'#5d5');
- rpm.textContent=s.rpm+' rpm';
+ temp.textContent=s.temp.toFixed(1)+' °C / '+(s.temp*9/5+32).toFixed(1)+' °F'+(s.trip?' TRIPPED':'')+((s.rfault&0xF0)?' FAULT':'');
+ temp.style.color = (s.trip||(s.rfault&0xF0))?'#f55':(s.temp>=s.twarnh?'#fa3':'#5d5');
+ mtemp.textContent=s.mtemp.toFixed(1)+' °C / '+(s.mtemp*9/5+32).toFixed(1)+' °F'+((s.rfault&0x0F)?' FAULT':'');
+ mtemp.style.color = (s.rfault&0x0F)?'#f55':(s.mtemp>=s.twarnm?'#fa3':'#5d5');
+ fanm.textContent=s.rpmm+' rpm @ '+s.fdm+'%';
+ fanh.textContent=s.rpmh+' rpm @ '+s.fdh+'%';
  zc.textContent=s.zc.toFixed(1)+' Hz';
  rt.textContent=s.run?(s.rt+' s'):'—';
  if(document.activeElement.tagName!='INPUT'){
@@ -933,17 +1068,19 @@ void handleState(){
     lastWebContactMs = millis();                       // keep-alive
     uint32_t rt = running ? (millis()-runStartMs)/1000 : 0;
     bool spresent = (statusHzX10 >= 600 && statusHzX10 <= 4000);  // v10: 60..400Hz (real strike ~220Hz)
-    char j[520];
+    char j[700];
     float zchz = zcPeriodUs ? 1000000.0/zcPeriodUs : 0.0;
     snprintf(j,sizeof(j),
       "{\"run\":%d,\"mode\":\"%s\",\"duty\":%d,\"freq\":%.1f,"
       "\"warm\":%.1f,\"runp\":%.1f,\"wms\":%lu,\"shz\":%.1f,\"spresent\":%d,"
-      "\"temp\":%.1f,\"tcut\":%.1f,\"twarn\":%.1f,\"trip\":%d,\"rpm\":%lu,\"zc\":%.1f,"
+      "\"mtemp\":%.1f,\"temp\":%.1f,\"tcutm\":%.1f,\"twarnm\":%.1f,\"tcuth\":%.1f,\"twarnh\":%.1f,"
+      "\"trip\":%d,\"rfault\":%d,\"rpmm\":%lu,\"rpmh\":%lu,\"fdm\":%d,\"fdh\":%d,\"zc\":%.1f,"
       "\"rt\":%lu,\"dm\":%d,\"dms\":%lu,\"mr\":%lu}",
       running?1:0, modeStr(), curDuty, pbFreqHz,
       pbWarmPct, pbRunPct, (unsigned long)pbWarmupMs,
       statusHzX10/10.0, spresent?1:0,
-      heatsinkC, tempCutoffC, tempWarnC, thermalTrip?1:0, (unsigned long)fanRpm, zchz,
+      magC, heatsinkC, tempCutoffMag, tempWarnMag, tempCutoffHs, tempWarnHs,
+      thermalTrip?1:0, rtdFault, (unsigned long)fanRpmMag, (unsigned long)fanRpmHs, fanDutyMag, fanDutyHs, zchz,
       (unsigned long)rt, deadmanOn?1:0,(unsigned long)deadmanSec,(unsigned long)maxRunSec);
     server.send(200,"application/json",j);
 }
@@ -952,8 +1089,10 @@ void handleSet(){
     if(server.hasArg("freq"))   pbFreqHz   = server.arg("freq").toFloat();
     if(server.hasArg("warm"))   pbWarmPct  = server.arg("warm").toFloat();
     if(server.hasArg("run"))    pbRunPct   = server.arg("run").toFloat();
-    if(server.hasArg("tcut"))   tempCutoffC= server.arg("tcut").toFloat();
-    if(server.hasArg("twarn"))  tempWarnC  = server.arg("twarn").toFloat();
+    if(server.hasArg("tcutm"))  tempCutoffMag= server.arg("tcutm").toFloat();
+    if(server.hasArg("twarnm")) tempWarnMag  = server.arg("twarnm").toFloat();
+    if(server.hasArg("tcuth"))  tempCutoffHs = server.arg("tcuth").toFloat();
+    if(server.hasArg("twarnh")) tempWarnHs   = server.arg("twarnh").toFloat();
     if(server.hasArg("warmms")){ long m=server.arg("warmms").toInt(); if(m>=0&&m<=20000) pbWarmupMs=m; }
     if(server.hasArg("deadman")) deadmanOn = server.arg("deadman").toInt()!=0;
     if(server.hasArg("dmsec")){ long s=server.arg("dmsec").toInt(); if(s>=3&&s<=120) deadmanSec=s; }
@@ -991,8 +1130,11 @@ void webTick(){
         float hz = (d/ (float)(now-lastS) *1000.0f)/2.0f;   // edges/s /2 = Hz
         statusHzX10 = (uint32_t)lroundf(hz*10.0f);
         // fan tach: most fans give 2 pulses/rev -> rpm = pulses/sec/2*60
-        uint32_t fc=fanTachCount; fanTachCount=0;
-        fanRpm = (uint32_t)lroundf( (fc/(float)(now-lastS)*1000.0f)/2.0f*60.0f );
+        uint32_t fm=fanTachMag; fanTachMag=0;
+        uint32_t fh=fanTachHs;  fanTachHs=0;
+        float k = (1000.0f/(float)(now-lastS))/2.0f*60.0f;   // pulses -> rpm (2 pulses/rev)
+        fanRpmMag = (uint32_t)lroundf(fm*k);
+        fanRpmHs  = (uint32_t)lroundf(fh*k);
         lastS=now;
     }
     // safety auto-off (web-initiated runs only; attended serial/button runs unaffected)
@@ -1024,17 +1166,19 @@ void setup(){
     pinMode(PIN_ZC, INPUT);
     attachInterrupt(PIN_ZC, onZeroCross, RISING);
 
-    // thermal + fan
-    analogReadResolution(12);
-    analogSetPinAttenuation(PIN_THERM, ADC_11db);   // full ~3.3V range (node ~1.65V at 25C)
-    pinMode(PIN_THERM, INPUT);
-    pinMode(PIN_FAN_PWM, OUTPUT);
-    digitalWrite(PIN_FAN_PWM, HIGH);            // fan 100% on (constant for now)
-    pinMode(PIN_FAN_TACH, INPUT_PULLUP);
-    attachInterrupt(PIN_FAN_TACH, onFanTach, FALLING);
-    heatsinkC = readHeatsinkC();
-    pinMode(PIN_BTN_ONOFF, INPUT_PULLUP);
-    pinMode(PIN_BTN_POWER, INPUT_PULLUP);
+    // thermal (2x MAX31865 PT100, manual-CS) + fan
+    pinMode(PIN_RTD_CS_MAG, OUTPUT); digitalWrite(PIN_RTD_CS_MAG, HIGH);
+    pinMode(PIN_RTD_CS_HS , OUTPUT); digitalWrite(PIN_RTD_CS_HS , HIGH);
+    SPIRTD.begin(PIN_RTD_SCK, PIN_RTD_MISO, PIN_RTD_MOSI, -1);   // -1 = no HW CS (manual)
+    rtdApplyWires();                             // no-op (wire mode applied per-read)
+    fanInit();                                   // 2x 4-wire PWM @25kHz, start 100%
+    pinMode(PIN_FAN_TACH_MAG, INPUT_PULLUP); attachInterrupt(PIN_FAN_TACH_MAG, onTachMag, FALLING);
+    pinMode(PIN_FAN_TACH_HS , INPUT_PULLUP); attachInterrupt(PIN_FAN_TACH_HS , onTachHs , FALLING);
+    rtdSweep();                                  // print raw+fault for 2/3/4-wire on both boards
+    readRTDs();                                  // prime magC/heatsinkC + fault mask
+    if(rtdFault)
+        Serial.printf("[RTD] boot fault 0x%02X  mag=%s  hs=%s  -> check probe wiring / 3-wire jumpers\n",
+                      rtdFault, (rtdFault&0x0F)?"FAULT":"ok", (rtdFault&0xF0)?"FAULT":"ok");
     cmdFreqHz=FREQ_LIST[freqIdx]; curRunDuty=RUN_STEPS[runIdx]; setDuty(curRunDuty);
     loadPrefs();                                 // v10: restore tuned params (NEVER run state)
     setDuty(curRunDuty);                         // re-apply after any freq/param restore
@@ -1047,16 +1191,12 @@ void setup(){
         (unsigned long)statusTimeoutMs, (unsigned long)cmdFreqHz);
     Serial.println(" GPIO4->YELLOW(cmd)  GPIO5<-ORANGE(status,via divider)  GND->BROWN");
     Serial.println(" REQUIRED for status read: 1k series + ~1k pulldown on GPIO5");
-    Serial.println(" 'on' or 'pulse 500'. 'force' = open-loop (proven single-IGBT path).");
+    Serial.println(" RTD bus: SCK11 MOSI12 MISO13  CS mag1 / hs6   Fans: mag PWM2/tach10  hs PWM8/tach3");
+    Serial.println(" 'on' or 'pulse 500'. 'force' = open-loop (proven single-IGBT path). Web-only buttons.");
     Serial.println("===============================================");
-    Serial.println(" [build: FBLOW-THERM-v10]  temp CALIBRATED (B3868/R0 100972/Rf 99k/Vsup 3311mV)");
+    Serial.println(" [build: FBLOW-RTD-FAN-v18]  Supermini map: 2x PT100 (shared SPI) + 2x 4-wire fans");
     Serial.printf ( " attempt-window default %lums | RUN strike-loss auto-off | NVS persist | boot-diag\n",
         (unsigned long)pbWarmupMs);
-#if BOOT_AUTOLOG
-    delay(500);
-    Serial.println("[AUTOLOG] capture build. cat /dev/ttyACM0 > run.txt");
-    logArm();
-#endif
     setupWeb();   // AP 'TermiteRF' / http://192.168.4.1/ — untethered control
 }
 
@@ -1066,13 +1206,8 @@ void loop(){
         if(ch=='\n'||ch=='\r'){ if(buf.length()){handle(buf);buf="";} }
         else if(buf.length()<32) buf+=ch;
     }
-    pollButtons();
-    thermalCheck();  // hard heatsink cutoff — runs every loop regardless of state
+    thermalCheck();  // hard per-sensor cutoff + fan control — runs every loop
     seqTick();    // closed-loop startup state machine (startup->status->run, w/ retry)
-    if(logArmed && logIdx>=LOG_MAXEDGES){ Serial.println("[log] buffer full."); logDump(); }
-    if(logArmed && logIdx>0 && (micros()-logFirstUs) > LOG_WINDOW_MS*1000UL){
-        Serial.println("[log] window elapsed."); logDump();
-    }
     webTick();        // serve web UI + status-rate sampling + safety auto-off
     delay(2);
 }

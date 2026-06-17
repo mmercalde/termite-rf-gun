@@ -1,14 +1,56 @@
 # MAX31865 PT100 RTD Bring-Up — Blocked by Bad Hardware
 
-**Date:** 2026-06-15 (extended evening bench session)
+**Date:** 2026-06-15 (extended evening bench session); **RESOLVED 2026-06-16**
 **Board:** ESP32-S3 Supermini (HW-747) gun controller + 2x GY-MAX31865 (purple
 CJMCU clone, PT100, RREF 430)
-**Outcome:** Thermal-sensing subsystem **not brought up.** Every external
-variable eliminated; failure isolated to defective MAX31865 boards and,
-separately, a bricked ESP32-S3. Firmware is complete and verified correct;
-it is gated only on working hardware.
+**Outcome:** **RESOLVED.** Root cause was the **MAX31865 CS→clock polarity-lock
+gap** the ESP32 SPI driver doesn't provide — fixed with manual-CS register
+access (firmware v18). Of the original two clone boards, **only one was
+actually dead**; the other works. See "Resolution" below.
 
 ---
+
+## Resolution (2026-06-16)
+
+The `RTD-MANCS-v1` test (manual CS as a plain GPIO + explicit
+`delayMicroseconds` gap before the first clock + a config write/read-back
+proof) was finally run on a **known-good ESP32**:
+
+```
+comms test: wrote 0x10 -> read 0x10 ; wrote 0x00 -> read 0x00  => SPI OK
+raw=8363  R=109.74 ohm  fault=0x00   <== CORRECT   (steady, 2-wire, WIRE3=false)
+```
+
+A/B with one variable changed (board only, same sketch/ESP32/wiring):
+
+| Board | comms test | reads |
+|-------|-----------|-------|
+| new board | `wrote 0x10 -> read 0x10` SPI OK | steady, correct |
+| old board #2 | `wrote 0x10 -> read 0x10` SPI OK | steady, correct |
+| old board #1 | `wrote 0x10 -> read 0x00` **SPI broken** | rail-flipping garbage |
+
+**Conclusions, corrected:**
+1. **Root cause = CS timing, not the boards.** The chip mis-detects SPI mode
+   when CS and clock drop together; a CS-low→first-clock gap fixes it. Every
+   earlier sketch (Adafruit software SPI, hardware SPI) let the driver/library
+   own CS and never provided the gap → garbage on *good* chips.
+2. **Only old board #1 is genuinely dead** (config register won't store a
+   written value). Old board #2 and the new boards all pass. The original
+   "bad batch, both boards defective" call was half right — one was bad — but
+   the dominant failure was CS timing, which would have defeated good boards too.
+3. The earlier `−242 °C` etc. on a *correct* 109.74 Ω read came from a bad
+   temperature polynomial in the throwaway test sketch; the **resistance** was
+   always the truth. Main firmware uses the proper Callendar–Van Dusen solver.
+
+**Firmware:** `panasonic_dual_igbt_esp32s3` converted to manual-CS on both RTD
+channels (bare-register reads with the gap; CVD temperature math) — **v18**.
+Default wire mode set to 2-wire (bench-confirmed; no trace cuts on the board).
+
+---
+
+## Original session writeup (2026-06-15)
+
+
 
 ## Goal
 
