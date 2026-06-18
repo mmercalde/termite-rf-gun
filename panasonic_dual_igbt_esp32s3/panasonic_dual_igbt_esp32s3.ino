@@ -883,7 +883,7 @@ void handle(String c){
         Serial.println(F("on off | play | pwarm <ms> | pulse <ms> | p<10-75> | f<hz>"));
         Serial.println(F("tmo <ms> | force | nostatus | caloff <C>"));
         Serial.println(F("statusinfo | zc | status"));
-        Serial.println(F("play=startup->run. RUN strike-loss auto-off (non-latch). RTD: PT100 x2. [build: FBLOW-RTD-FAN-v18]"));
+        Serial.println(F("play=startup->run. RUN strike-loss auto-off (non-latch). RTD: PT100 x2. [build: FBLOW-RTD-FAN-v19]"));
         Serial.println(F("Cap 75% on p<>; play bypasses cap (uses recorded ticks). 'pulse 500' bounded. Params persist (NVS)."));
     }
     else if(lc=="on"){ startRun(); }
@@ -954,6 +954,10 @@ void handle(String c){
             running, curDuty, (unsigned long)cmdFreqHz,
             (unsigned long)statusTimeoutMs,
             forceMode, statusBypass);
+        readRTDs();   // refresh magC/heatsinkC/rtdFault
+        Serial.printf("[temps] mag=%.1fC/%.1fF %s  |  hs=%.1fC/%.1fF %s\n",
+            magC, magC*9.0f/5.0f+32.0f, (rtdFault&0x0F)?"[FAULT]":"ok",
+            heatsinkC, heatsinkC*9.0f/5.0f+32.0f, (rtdFault&0xF0)?"[FAULT]":"ok");
     }
     else if(lc=="zc"){
         Serial.printf("[zc] period=%luus ~%.1fHz (%s)\n",
@@ -1194,7 +1198,7 @@ void setup(){
     Serial.println(" RTD bus: SCK11 MOSI12 MISO13  CS mag1 / hs6   Fans: mag PWM2/tach10  hs PWM8/tach3");
     Serial.println(" 'on' or 'pulse 500'. 'force' = open-loop (proven single-IGBT path). Web-only buttons.");
     Serial.println("===============================================");
-    Serial.println(" [build: FBLOW-RTD-FAN-v18]  Supermini map: 2x PT100 (shared SPI) + 2x 4-wire fans");
+    Serial.println(" [build: FBLOW-RTD-FAN-v19]  Supermini map: 2x PT100 (shared SPI) + 2x 4-wire fans");
     Serial.printf ( " attempt-window default %lums | RUN strike-loss auto-off | NVS persist | boot-diag\n",
         (unsigned long)pbWarmupMs);
     setupWeb();   // AP 'TermiteRF' / http://192.168.4.1/ — untethered control
