@@ -135,7 +135,7 @@ constexpr int FAN_CH_HS    = 5;
 // 3V3 + GND run as a single harness to a junction, then split to both boards.
 // Only the two CS lines are per-board (they CANNOT be tied — bus contention).
 // Feed Vin = 3V3 (NOT 5V) so SDO stays at 3.3V into the ESP32.
-constexpr int PIN_RTD_SCK    = 11;  // CLK   -> both boards
+constexpr int PIN_RTD_SCK    = 9;   // CLK   -> both boards  [MOVED off FSPI GPIO11: any load on GPIO11 kills 2.4GHz WiFi]
 constexpr int PIN_RTD_MOSI   = 12;  // SDI   -> both boards (data INTO  MAX31865)
 constexpr int PIN_RTD_MISO   = 13;  // SDO   <- both boards (data OUT of MAX31865)
 constexpr int PIN_RTD_CS_MAG = 1;   // CS: magnetron-fin board  [was 10; freed for fan tach]
@@ -234,6 +234,12 @@ float    thermCalOffset = 0.0f;           // optional live trim (deg C), applied
 float    magC        = 25.0f;             // magnetron-fin temp
 float    heatsinkC   = 25.0f;             // IGBT-heatsink temp (name kept -> web/JSON untouched)
 uint8_t  rtdFault    = 0;                  // fault bitmask: low nibble=mag, high nibble=hs (0=ok)
+// v25: fault debounce + event counters. A single noisy SPI read should NOT slam a
+// fan to 100%. Require N consecutive bad reads before declaring a real fault.
+uint8_t  rtdFaultDeb = 0;                  // DEBOUNCED fault mask (what the fan curve acts on)
+uint8_t  rtdBadMag = 0, rtdBadHs = 0;      // consecutive bad-read counters
+uint32_t rtdFaultEvtMag = 0, rtdFaultEvtHs = 0;  // total debounced fault events since boot
+constexpr uint8_t RTD_FAULT_DEB_N = 3;     // need 3 consecutive bad reads to count as fault
 // Per-sensor thresholds — magnetron fins and IGBT heatsink have very different
 // limits, so they get INDEPENDENT cutoffs. All web-adjustable + NVS-persisted.
 //   Magnetron: flange thermal fuse ~150C; fins run 100-150C under load -> a
@@ -257,6 +263,7 @@ bool     thermalTrip = false;             // latched until manual restart
 // ---- Fan tach (one per fan, 2 pulses/rev typical) ----
 volatile uint32_t fanTachMag = 0, fanTachHs = 0;
 uint32_t fanRpmMag = 0, fanRpmHs = 0;
+uint32_t monPeriodMs = 1000;   // v25: continuous temp/fan stream period (0=off, default 1s)
 void IRAM_ATTR onTachMag(){ fanTachMag++; }
 void IRAM_ATTR onTachHs (){ fanTachHs++; }
 
@@ -533,7 +540,19 @@ float readRTDs(){
     uint8_t fM=0, fH=0;
     magC      = readOneRTD(PIN_RTD_CS_MAG, fM);
     heatsinkC = readOneRTD(PIN_RTD_CS_HS , fH);
-    rtdFault  = (fM?0x0F:0) | (fH?0xF0:0);
+    rtdFault  = (fM?0x0F:0) | (fH?0xF0:0);   // raw, instantaneous (for status display)
+
+    // ---- v25 debounce: N consecutive bad reads before it's a "real" fault ----
+    if(fM){ if(rtdBadMag < 255) rtdBadMag++; } else rtdBadMag = 0;
+    if(fH){ if(rtdBadHs  < 255) rtdBadHs++;  } else rtdBadHs  = 0;
+    uint8_t prevDeb = rtdFaultDeb;
+    uint8_t debM = (rtdBadMag >= RTD_FAULT_DEB_N) ? 0x0F : 0;
+    uint8_t debH = (rtdBadHs  >= RTD_FAULT_DEB_N) ? 0xF0 : 0;
+    rtdFaultDeb = debM | debH;
+    // count a fault EVENT on the rising edge (ok -> faulted), per sensor
+    if((debM && !(prevDeb&0x0F))) rtdFaultEvtMag++;
+    if((debH && !(prevDeb&0xF0))) rtdFaultEvtHs++;
+
     float hm = fM ? -100.0f : magC;       // faulted sensor can't win the max
     float hh = fH ? -100.0f : heatsinkC;
     return (hm > hh) ? hm : hh;
@@ -568,9 +587,10 @@ static uint8_t fanCurve(float t, float rampStart, float warn){
     return (uint8_t)lroundf(p);
 }
 void fanControl(){
-    // faulted sensor -> force that fan to 100% (fail-safe to max cooling)
-    fanDutyMag = (rtdFault & 0x0F) ? 100 : fanCurve(magC,      FAN_RAMP_MAG, tempWarnMag);
-    fanDutyHs  = (rtdFault & 0xF0) ? 100 : fanCurve(heatsinkC, FAN_RAMP_HS,  tempWarnHs);
+    // faulted sensor -> force that fan to 100% (fail-safe). Uses DEBOUNCED fault
+    // (v25) so a single noisy SPI read no longer causes a phantom full-speed surge.
+    fanDutyMag = (rtdFaultDeb & 0x0F) ? 100 : fanCurve(magC,      FAN_RAMP_MAG, tempWarnMag);
+    fanDutyHs  = (rtdFaultDeb & 0xF0) ? 100 : fanCurve(heatsinkC, FAN_RAMP_HS,  tempWarnHs);
     fanWrite(PIN_FAN_PWM_MAG, FAN_CH_MAG, fanDutyMag);
     fanWrite(PIN_FAN_PWM_HS , FAN_CH_HS , fanDutyHs);
 }
@@ -882,8 +902,8 @@ void handle(String c){
     if(lc=="?"||lc=="help"){
         Serial.println(F("on off | play | pwarm <ms> | pulse <ms> | p<10-75> | f<hz>"));
         Serial.println(F("tmo <ms> | force | nostatus | caloff <C>"));
-        Serial.println(F("statusinfo | zc | status"));
-        Serial.println(F("play=startup->run. RUN strike-loss auto-off (non-latch). RTD: PT100 x2. [build: FBLOW-RTD-FAN-v19]"));
+        Serial.println(F("statusinfo | zc | status | mon <ms>"));
+        Serial.println(F("play=startup->run. RUN strike-loss auto-off (non-latch). RTD: PT100 x2. [build: FBLOW-RTD-FAN-v25]"));
         Serial.println(F("Cap 75% on p<>; play bypasses cap (uses recorded ticks). 'pulse 500' bounded. Params persist (NVS)."));
     }
     else if(lc=="on"){ startRun(); }
@@ -898,6 +918,50 @@ void handle(String c){
             uint16_t rH = rtdReadRaw(PIN_RTD_CS_HS , fH);
             Serial.printf("[wire] %d-wire -> mag raw=%u flt=0x%02X | hs raw=%u flt=0x%02X (saved)\n", n,rM,fM,rH,fH);
         } else Serial.println("usage: wire <2|3|4>");
+    }
+    else if(lc.startsWith("mon")){
+        String a = c.substring(3); a.trim();
+        if(a.length()==0){
+            Serial.printf("[mon] period=%lums (%s). 'mon 0'=off, 'mon 500'=2/sec, 'mon 2000'=slow\n",
+                (unsigned long)monPeriodMs, monPeriodMs?"on":"off");
+        } else {
+            long ms = a.toInt();
+            if(ms==0){ monPeriodMs=0; Serial.println("[mon] off"); }
+            else if(ms>=200 && ms<=10000){ monPeriodMs=(uint32_t)ms;
+                Serial.printf("[mon] streaming every %ldms\n", ms); }
+            else Serial.println("[mon] usage: mon <0 | 200..10000>");
+        }
+    }
+    else if(lc=="wifiscan"){
+        Serial.println("[wifiscan] scanning 2.4GHz (AP may blip)...");
+        WiFi.mode(WIFI_AP_STA);
+        int n = WiFi.scanNetworks();
+        int chCount[14] = {0};
+        for(int i=0;i<n;i++){
+            int ch = WiFi.channel(i);
+            if(ch>=1 && ch<=13) chCount[ch]++;
+            Serial.printf("   %2d  ch%-2d  %4ddBm  %s%s\n", i+1, ch, (int)WiFi.RSSI(i),
+                WiFi.SSID(i).c_str(), WiFi.encryptionType(i)==WIFI_AUTH_OPEN?" [open]":"");
+        }
+        Serial.print("[wifiscan] APs/channel: ");
+        for(int ch=1; ch<=11; ch++) Serial.printf("ch%d=%d ", ch, chCount[ch]);
+        int best=1; for(int ch=1; ch<=13; ch++) if(chCount[ch] < chCount[best]) best=ch;
+        // prefer a non-overlapping channel (1/6/11) among the cleanest
+        int bestStd=1; for(int s=0;s<3;s++){ int cand=(int[]){1,6,11}[s]; if(chCount[cand]<chCount[bestStd]) bestStd=cand; }
+        Serial.printf("\n[wifiscan] cleanest 1/6/11 -> ch%d (abs cleanest ch%d). Move AP: 'wifich %d'\n", bestStd, best, bestStd);
+        WiFi.scanDelete();
+        WiFi.mode(WIFI_AP);
+    }
+    else if(lc.startsWith("wifich")){
+        int ch = c.substring(6).toInt();
+        if(ch>=1 && ch<=13){
+            WiFi.softAPdisconnect(true); delay(100);
+            WiFi.mode(WIFI_AP); delay(100);
+            bool ok = WiFi.softAP(AP_SSID, AP_PASS, ch, 0, 4);
+            delay(150);
+            Serial.printf("[wifich] AP -> ch%d => %s  ip=%s  (max TX)\n", ch,
+                ok?"UP":"FAIL", WiFi.softAPIP().toString().c_str());
+        } else Serial.println("usage: wifich <1-13>");
     }
     else if(lc=="play"){ startPlayback(); }
     else if(lc.startsWith("pwarm")){
@@ -955,9 +1019,13 @@ void handle(String c){
             (unsigned long)statusTimeoutMs,
             forceMode, statusBypass);
         readRTDs();   // refresh magC/heatsinkC/rtdFault
-        Serial.printf("[temps] mag=%.1fC/%.1fF %s  |  hs=%.1fC/%.1fF %s\n",
+        Serial.printf("[temps] mag=%.1fC/%.1fF %s  |  hs=%.1fC/%.1fF %s  (faults: mag=%lu hs=%lu)\n",
             magC, magC*9.0f/5.0f+32.0f, (rtdFault&0x0F)?"[FAULT]":"ok",
-            heatsinkC, heatsinkC*9.0f/5.0f+32.0f, (rtdFault&0xF0)?"[FAULT]":"ok");
+            heatsinkC, heatsinkC*9.0f/5.0f+32.0f, (rtdFault&0xF0)?"[FAULT]":"ok",
+            (unsigned long)rtdFaultEvtMag, (unsigned long)rtdFaultEvtHs);
+        Serial.printf("[fans]  mag=%lurpm @ %d%%  |  hs=%lurpm @ %d%%\n",
+            (unsigned long)fanRpmMag, fanDutyMag,
+            (unsigned long)fanRpmHs,  fanDutyHs);
     }
     else if(lc=="zc"){
         Serial.printf("[zc] period=%luus ~%.1fHz (%s)\n",
@@ -1112,7 +1180,19 @@ void handleSet(){
 
 void setupWeb(){
     WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_SSID, AP_PASS);
+    delay(100);
+    // v22: REVERTED to the simple call that worked on v18. The v20/v21 additions
+    // (explicit channel 6 + setTxPower) caused clients to see the AP but fail to
+    // associate. Default channel, default TX. Keep the success-check for honesty.
+    bool ok = WiFi.softAP(AP_SSID, AP_PASS);
+    delay(200);
+    if(!ok){
+        Serial.println("[WiFi] softAP FAILED first try; retrying...");
+        WiFi.mode(WIFI_AP); delay(150);
+        ok = WiFi.softAP(AP_SSID, AP_PASS);
+        delay(200);
+    }
+    IPAddress ip = WiFi.softAPIP();
     server.on("/", handleRoot);
     server.on("/state", handleState);
     server.on("/set", handleSet);
@@ -1120,7 +1200,10 @@ void setupWeb(){
                              lastWebContactMs=millis(); server.send(200,"text/plain","ok"); });
     server.on("/off",  [](){ stopRun(); server.send(200,"text/plain","ok"); });
     server.begin();
-    Serial.printf("[WiFi] AP '%s' (pass '%s')  ->  http://192.168.4.1/\n", AP_SSID, AP_PASS);
+    Serial.printf("[WiFi] AP '%s' => %s  ip=%s  ch6  mac=%s\n",
+        AP_SSID, ok ? "UP" : "DOWN(FAILED)", ip.toString().c_str(),
+        WiFi.softAPmacAddress().c_str());
+    if(!ok) Serial.println("[WiFi] AP did NOT start — phone/PC won't see 'TermiteRF'. Use serial 'status' meanwhile.");
 }
 
 // safety + status-rate sampling, called from loop()
@@ -1139,6 +1222,10 @@ void webTick(){
         float k = (1000.0f/(float)(now-lastS))/2.0f*60.0f;   // pulses -> rpm (2 pulses/rev)
         fanRpmMag = (uint32_t)lroundf(fm*k);
         fanRpmHs  = (uint32_t)lroundf(fh*k);
+        // v25 sanity clamp: a real fan can't exceed ~6000rpm. Anything above 8000
+        // is tach noise (e.g. floating/unconnected line picking up inverter edges).
+        if(fanRpmMag > 8000) fanRpmMag = 0;
+        if(fanRpmHs  > 8000) fanRpmHs  = 0;
         lastS=now;
     }
     // safety auto-off (web-initiated runs only; attended serial/button runs unaffected)
@@ -1195,10 +1282,10 @@ void setup(){
         (unsigned long)statusTimeoutMs, (unsigned long)cmdFreqHz);
     Serial.println(" GPIO4->YELLOW(cmd)  GPIO5<-ORANGE(status,via divider)  GND->BROWN");
     Serial.println(" REQUIRED for status read: 1k series + ~1k pulldown on GPIO5");
-    Serial.println(" RTD bus: SCK11 MOSI12 MISO13  CS mag1 / hs6   Fans: mag PWM2/tach10  hs PWM8/tach3");
+    Serial.println(" RTD bus: SCK9 MOSI12 MISO13  CS mag1 / hs6   Fans: mag PWM2/tach10  hs PWM8/tach3");
     Serial.println(" 'on' or 'pulse 500'. 'force' = open-loop (proven single-IGBT path). Web-only buttons.");
     Serial.println("===============================================");
-    Serial.println(" [build: FBLOW-RTD-FAN-v19]  Supermini map: 2x PT100 (shared SPI) + 2x 4-wire fans");
+    Serial.println(" [build: FBLOW-RTD-FAN-v25]  Supermini map: 2x PT100 (shared SPI) + 2x 4-wire fans");
     Serial.printf ( " attempt-window default %lums | RUN strike-loss auto-off | NVS persist | boot-diag\n",
         (unsigned long)pbWarmupMs);
     setupWeb();   // AP 'TermiteRF' / http://192.168.4.1/ — untethered control
@@ -1213,5 +1300,19 @@ void loop(){
     thermalCheck();  // hard per-sensor cutoff + fan control — runs every loop
     seqTick();    // closed-loop startup state machine (startup->status->run, w/ retry)
     webTick();        // serve web UI + status-rate sampling + safety auto-off
+
+    // v25: continuous temp/fan stream (replaces the lost web UI for bench work).
+    // 'mon <ms>' sets the period (0=off). Default 1000ms = 1 line/sec.
+    if(monPeriodMs){
+        static uint32_t lastMon=0; uint32_t nowm=millis();
+        if(nowm-lastMon >= monPeriodMs){
+            lastMon=nowm;
+            readRTDs();
+            Serial.printf("[mon] mag=%.1fC %s %lurpm@%d%%  |  hs=%.1fC %s %lurpm@%d%%  (flt mag=%lu hs=%lu)\n",
+                magC, (rtdFault&0x0F)?"FLT":"ok", (unsigned long)fanRpmMag, fanDutyMag,
+                heatsinkC, (rtdFault&0xF0)?"FLT":"ok", (unsigned long)fanRpmHs, fanDutyHs,
+                (unsigned long)rtdFaultEvtMag, (unsigned long)rtdFaultEvtHs);
+        }
+    }
     delay(2);
 }
