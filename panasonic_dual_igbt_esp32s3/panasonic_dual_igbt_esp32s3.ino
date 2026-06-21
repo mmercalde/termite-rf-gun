@@ -123,8 +123,8 @@ constexpr int PIN_ZC      = 7;   // zero-cross monitor
 //   GPIO3 = strapping; used as a tach INPUT (idles HIGH) so it's boot-safe.
 constexpr int PIN_FAN_PWM_MAG  = 2;   // mag fan PWM out (control wire / blue)
 constexpr int PIN_FAN_TACH_MAG = 10;  // mag fan tach in (yellow)  [was 1; matches wired fan]
-constexpr int PIN_FAN_PWM_HS   = 8;   // hs  fan PWM out (on-board LED pin -> dim)
-constexpr int PIN_FAN_TACH_HS  = 3;   // hs  fan tach in (strapping; input idles HIGH)
+constexpr int PIN_FAN_PWM_HS   = 43;  // hs fan PWM out  [MOVED off GPIO8: that's the onboard-LED pin, dirty switching coupled into the hs tach. GPIO43=TX/UART0, free (console is USB-CDC)]
+constexpr int PIN_FAN_TACH_HS  = 44;  // hs fan tach in  [MOVED off GPIO3: that strapping/JTAG pin self-oscillates ~25kHz. GPIO44=RX/UART0, free (console is USB-CDC), clean non-FSPI]
 constexpr int FAN_PWM_HZ   = 25000;   // Intel 4-wire spec ~25kHz (inaudible)
 constexpr int FAN_PWM_BITS = 8;       // 0..255
 constexpr int FAN_CH_MAG   = 4;       // LEDC channel (Arduino core 2.x; ignored on 3.x)
@@ -263,6 +263,7 @@ bool     thermalTrip = false;             // latched until manual restart
 // ---- Fan tach (one per fan, 2 pulses/rev typical) ----
 volatile uint32_t fanTachMag = 0, fanTachHs = 0;
 uint32_t fanRpmMag = 0, fanRpmHs = 0;
+uint32_t fanRawMag = 0, fanRawHs = 0;   // v25.1: pre-clamp raw rpm (diagnostic)
 uint32_t monPeriodMs = 1000;   // v25: continuous temp/fan stream period (0=off, default 1s)
 void IRAM_ATTR onTachMag(){ fanTachMag++; }
 void IRAM_ATTR onTachHs (){ fanTachHs++; }
@@ -903,7 +904,7 @@ void handle(String c){
         Serial.println(F("on off | play | pwarm <ms> | pulse <ms> | p<10-75> | f<hz>"));
         Serial.println(F("tmo <ms> | force | nostatus | caloff <C>"));
         Serial.println(F("statusinfo | zc | status | mon <ms>"));
-        Serial.println(F("play=startup->run. RUN strike-loss auto-off (non-latch). RTD: PT100 x2. [build: FBLOW-RTD-FAN-v25]"));
+        Serial.println(F("play=startup->run. RUN strike-loss auto-off (non-latch). RTD: PT100 x2. [build: FBLOW-RTD-FAN-v25.3]"));
         Serial.println(F("Cap 75% on p<>; play bypasses cap (uses recorded ticks). 'pulse 500' bounded. Params persist (NVS)."));
     }
     else if(lc=="on"){ startRun(); }
@@ -1222,8 +1223,8 @@ void webTick(){
         float k = (1000.0f/(float)(now-lastS))/2.0f*60.0f;   // pulses -> rpm (2 pulses/rev)
         fanRpmMag = (uint32_t)lroundf(fm*k);
         fanRpmHs  = (uint32_t)lroundf(fh*k);
-        // v25 sanity clamp: a real fan can't exceed ~6000rpm. Anything above 8000
-        // is tach noise (e.g. floating/unconnected line picking up inverter edges).
+        fanRawMag = fanRpmMag; fanRawHs = fanRpmHs;   // keep raw (diagnostic)
+        // clamp DISPLAYED rpm to a realistic ceiling; raw stays visible for debug
         if(fanRpmMag > 8000) fanRpmMag = 0;
         if(fanRpmHs  > 8000) fanRpmHs  = 0;
         lastS=now;
@@ -1282,10 +1283,10 @@ void setup(){
         (unsigned long)statusTimeoutMs, (unsigned long)cmdFreqHz);
     Serial.println(" GPIO4->YELLOW(cmd)  GPIO5<-ORANGE(status,via divider)  GND->BROWN");
     Serial.println(" REQUIRED for status read: 1k series + ~1k pulldown on GPIO5");
-    Serial.println(" RTD bus: SCK9 MOSI12 MISO13  CS mag1 / hs6   Fans: mag PWM2/tach10  hs PWM8/tach3");
+    Serial.println(" RTD bus: SCK9 MOSI12 MISO13  CS mag1 / hs6   Fans: mag PWM2/tach10  hs PWM43/tach44");
     Serial.println(" 'on' or 'pulse 500'. 'force' = open-loop (proven single-IGBT path). Web-only buttons.");
     Serial.println("===============================================");
-    Serial.println(" [build: FBLOW-RTD-FAN-v25]  Supermini map: 2x PT100 (shared SPI) + 2x 4-wire fans");
+    Serial.println(" [build: FBLOW-RTD-FAN-v25.3]  Supermini map: 2x PT100 (shared SPI) + 2x 4-wire fans");
     Serial.printf ( " attempt-window default %lums | RUN strike-loss auto-off | NVS persist | boot-diag\n",
         (unsigned long)pbWarmupMs);
     setupWeb();   // AP 'TermiteRF' / http://192.168.4.1/ — untethered control
@@ -1308,9 +1309,9 @@ void loop(){
         if(nowm-lastMon >= monPeriodMs){
             lastMon=nowm;
             readRTDs();
-            Serial.printf("[mon] mag=%.1fC %s %lurpm@%d%%  |  hs=%.1fC %s %lurpm@%d%%  (flt mag=%lu hs=%lu)\n",
+            Serial.printf("[mon] mag=%.1fC %s %lurpm@%d%%  |  hs=%.1fC %s %lurpm(raw%lu)@%d%%  (flt mag=%lu hs=%lu)\n",
                 magC, (rtdFault&0x0F)?"FLT":"ok", (unsigned long)fanRpmMag, fanDutyMag,
-                heatsinkC, (rtdFault&0xF0)?"FLT":"ok", (unsigned long)fanRpmHs, fanDutyHs,
+                heatsinkC, (rtdFault&0xF0)?"FLT":"ok", (unsigned long)fanRpmHs, (unsigned long)fanRawHs, fanDutyHs,
                 (unsigned long)rtdFaultEvtMag, (unsigned long)rtdFaultEvtHs);
         }
     }
